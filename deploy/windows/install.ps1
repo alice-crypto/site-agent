@@ -124,6 +124,10 @@ if (-not (Test-Path (Join-Path $InstallDir 'src\cli.js'))) { throw "Site Agent e
 Write-Host "Node.js $NodeVersion, Git et Caddy trouvés. Dossier : $InstallDir"
 
 Write-Step "Compte Windows dédié « $ServiceUser »"
+# Un contrôleur de domaine n'a pas de comptes locaux : l'agent doit être installé sur un serveur membre.
+if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4) {
+  throw "Ce serveur est un contrôleur de domaine, qui n'a pas de comptes locaux. Installez Site Agent sur un autre serveur."
+}
 $Existing = Get-LocalUser -Name $ServiceUser -ErrorAction SilentlyContinue
 if ($Existing) {
   $Password = Read-Host "Mot de passe du compte $ServiceUser" -AsSecureString
@@ -136,16 +140,21 @@ if ($Existing) {
     -Description 'Compte de service de Site Agent' | Out-Null
   Write-Host "Compte créé, sans droits d'administrateur."
 }
+# Le nom « MACHINE\compte » ne se résout pas toujours (serveur membre d'un domaine, nom renommé) :
+# les droits sont donnés par l'identifiant de sécurité (SID), qui est sans ambiguïté.
+$ServiceSid = (Get-LocalUser -Name $ServiceUser).SID
+$ServiceAccount = try { $ServiceSid.Translate([System.Security.Principal.NTAccount]).Value } catch { ".\$ServiceUser" }
+Write-Host "Compte : $ServiceAccount ($($ServiceSid.Value))"
 
 Write-Step 'Droits sur le dossier de Site Agent'
 foreach ($Folder in 'logs', 'checkouts', 'backups', '.site-agent', 'sites') {
   New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir $Folder) | Out-Null
 }
-& icacls $InstallDir /grant "${env:COMPUTERNAME}\${ServiceUser}:(OI)(CI)M" /T /Q | Out-Null
+& icacls $InstallDir /grant "*$($ServiceSid.Value):(OI)(CI)M" /T /Q | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Impossible de donner les droits sur $InstallDir." }
 # Les comptes et l'historique ne doivent être lisibles que par le compte de service et les administrateurs.
-& icacls (Join-Path $InstallDir '.site-agent') /inheritance:r /grant:r "${env:COMPUTERNAME}\${ServiceUser}:(OI)(CI)M" `
-  'BUILTIN\Administrators:(OI)(CI)F' 'NT AUTHORITY\SYSTEM:(OI)(CI)F' /T /Q | Out-Null
+& icacls (Join-Path $InstallDir '.site-agent') /inheritance:r /grant:r "*$($ServiceSid.Value):(OI)(CI)M" `
+  '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' /T /Q | Out-Null
 Write-Host 'Droits accordés.'
 
 Write-Step 'Adresse publique'
@@ -161,7 +170,7 @@ $AgentAction = New-ScheduledTaskAction -Execute 'cmd.exe' `
   -Argument "/c `"`"$Node`" src\cli.js serve >> logs\agent.log 2>&1`"" `
   -WorkingDirectory $InstallDir
 Register-ScheduledTask -TaskName $AgentTask -Action $AgentAction -Trigger (New-ServiceTriggers) `
-  -Settings (New-ServiceSettings) -User "${env:COMPUTERNAME}\$ServiceUser" -Password (Get-PlainText $Password) `
+  -Settings (New-ServiceSettings) -User $ServiceAccount -Password (Get-PlainText $Password) `
   -RunLevel Limited -Description 'Surveillance et mise à jour des sites' -Force | Out-Null
 Write-Host 'Tâche créée : elle démarre avec le serveur, sous le compte dédié.'
 

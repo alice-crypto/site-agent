@@ -117,7 +117,8 @@ Si le site doit d'abord être construit (`npm run build`, par exemple), copiez l
 Donnez une fois au compte `site-agent` le droit d'écrire dans le dossier du site (PowerShell administrateur) :
 
 ```powershell
-icacls C:\inetpub\wwwroot\mon-site /grant "site-agent:(OI)(CI)M"
+$Sid = (Get-LocalUser site-agent).SID.Value
+icacls C:\inetpub\wwwroot\mon-site /grant "*${Sid}:(OI)(CI)M"
 ```
 
 ## 9. Inviter l'équipe
