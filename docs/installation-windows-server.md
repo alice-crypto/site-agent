@@ -45,13 +45,13 @@ Toutes les étapes suivantes se font sur le serveur.
 
 ## 5. Copier Site Agent sur le serveur
 
-Ouvrez **PowerShell**. Si Site Agent est dans un dépôt Git :
+Ouvrez **PowerShell** et récupérez Site Agent depuis GitHub :
 
 ```powershell
-git clone <adresse-de-votre-dépôt-site-agent> C:\site-agent
+git clone https://github.com/alice-crypto/site-agent.git C:\site-agent
 ```
 
-Sinon, copiez simplement le dossier `site-agent` de votre PC vers `C:\site-agent`. Les fichiers se collent directement dans la fenêtre du Bureau à distance.
+Vous pouvez aussi copier le dossier `site-agent` de votre PC vers `C:\site-agent`. Les fichiers se collent directement dans la fenêtre du Bureau à distance.
 
 ## 6. Lancer l'installation
 
