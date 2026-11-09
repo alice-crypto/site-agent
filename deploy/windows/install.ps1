@@ -17,16 +17,31 @@
     6. ouvre les ports 80 et 443 du pare-feu, et seulement ceux-là ;
     7. démarre le tout et affiche le lien de création du premier administrateur.
 
+  Sur un réseau local (adresse IP ou nom interne), Caddy crée ses propres certificats : le script
+  fournit alors le certificat racine à installer sur les PC de l'équipe, et n'ouvre le pare-feu
+  qu'au réseau local.
+
 .EXAMPLE
   .\deploy\windows\install.ps1 -Domain agent.mon-entreprise.fr
+
+.EXAMPLE
+  .\deploy\windows\install.ps1 -Address 10.10.10.18
+
+.EXAMPLE
+  .\deploy\windows\install.ps1 -Address 10.10.10.18 -AllowFrom 10.10.0.0/16
 #>
 param(
   [Parameter(Mandatory = $true)]
+  [Alias('Address')]
   [string] $Domain,
   [string] $InstallDir = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path,
   [string] $ServiceUser = 'site-agent',
   [string] $CaddyPath = 'C:\caddy\caddy.exe',
-  [int] $Port = 4310
+  [int] $Port = 4310,
+  # Nom interne (ex. agent.intranet) qui n'est pas joignable depuis Internet : certificats internes.
+  [switch] $Internal,
+  # Qui peut joindre l'agent. Par défaut : le réseau local en interne, tout le monde sinon.
+  [string[]] $AllowFrom
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,9 +80,16 @@ function New-ServiceSettings {
 }
 
 Write-Step 'Vérification des prérequis'
-if ($Domain -notmatch '^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$') {
-  throw "Nom de domaine invalide : $Domain. Exemple attendu : agent.mon-entreprise.fr"
+$IsIpAddress = $Domain -match '^\d{1,3}(\.\d{1,3}){3}$'
+if ($IsIpAddress) {
+  if ($Domain.Split('.') | Where-Object { [int]$_ -gt 255 }) { throw "Adresse IP invalide : $Domain" }
+} elseif ($Domain -notmatch '^(?=.{2,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$') {
+  throw "Adresse invalide : $Domain. Exemples : agent.mon-entreprise.fr ou 10.10.10.18"
 }
+# Un certificat public n'est délivré que pour un nom joignable depuis Internet : sinon, Caddy signe lui-même.
+$UseInternalTls = $IsIpAddress -or $Internal -or ($Domain -notmatch '\.')
+if (-not $AllowFrom) { $AllowFrom = if ($UseInternalTls) { @('LocalSubnet') } else { @('Any') } }
+Write-Host "Adresse : https://$Domain (certificat $(if ($UseInternalTls) { 'interne' } else { 'public, Let''s Encrypt' })). Accès autorisé depuis : $($AllowFrom -join ', ')"
 $Node = (Get-Command node -ErrorAction SilentlyContinue).Source
 if (-not $Node) { throw 'Node.js est introuvable. Installez la version LTS depuis https://nodejs.org puis relancez ce script.' }
 $NodeVersion = [version]((& $Node --version).TrimStart('v'))
@@ -122,13 +144,24 @@ Write-Host 'Tâche créée : elle démarre avec le serveur, sous le compte dédi
 Write-Step "Tâche « $CaddyTask » (HTTPS)"
 $CaddyDir = Split-Path $CaddyPath
 $Caddyfile = Join-Path $CaddyDir 'Caddyfile'
-$CaddyConfig = @"
+if ($UseInternalTls) {
+  $CaddyConfig = @"
+# Créé par Site Agent. Réseau local : Caddy signe lui-même le certificat avec sa propre autorité.
+https://$Domain {
+	tls internal
+	encode gzip
+	reverse_proxy 127.0.0.1:$Port
+}
+"@
+} else {
+  $CaddyConfig = @"
 # Créé par Site Agent. Caddy obtient et renouvelle le certificat HTTPS tout seul.
 $Domain {
 	encode gzip
 	reverse_proxy 127.0.0.1:$Port
 }
 "@
+}
 [System.IO.File]::WriteAllText($Caddyfile, $CaddyConfig, [System.Text.UTF8Encoding]::new($false))
 $CaddyAction = New-ScheduledTaskAction -Execute $CaddyPath -Argument "run --config `"$Caddyfile`" --adapter caddyfile" -WorkingDirectory $CaddyDir
 # Caddy a besoin des ports 80 et 443 : il tourne sous le compte système, l'agent non.
@@ -140,10 +173,16 @@ Write-Host "Caddy configuré dans $Caddyfile"
 Write-Step 'Pare-feu : ports 80 et 443 uniquement'
 foreach ($FirewallPort in 80, 443) {
   $RuleName = "Site Agent - HTTPS ($FirewallPort)"
-  if (-not (Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue)) {
-    New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Protocol TCP -LocalPort $FirewallPort -Action Allow | Out-Null
+  $Rule = Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue
+  if ($Rule) {
+    # Relancer le script avec un autre -AllowFrom met la règle à jour.
+    $Rule | Set-NetFirewallRule -RemoteAddress $AllowFrom
+  } else {
+    New-NetFirewallRule -DisplayName $RuleName -Direction Inbound -Protocol TCP -LocalPort $FirewallPort `
+      -RemoteAddress $AllowFrom -Action Allow | Out-Null
   }
 }
+Write-Host "Ouverts depuis : $($AllowFrom -join ', ')"
 Write-Host "Le port $Port de l'agent reste fermé à l'extérieur : seul Caddy y accède."
 
 Write-Step 'Démarrage'
@@ -161,12 +200,34 @@ foreach ($Attempt in 1..20) {
 if (-not $Ready) { throw "L'agent ne répond pas. Consultez $InstallDir\logs\agent.log" }
 Write-Host 'Site Agent répond.' -ForegroundColor Green
 
+if ($UseInternalTls) {
+  Write-Step 'Certificat racine pour les PC de l''équipe'
+  # Caddy tourne sous le compte système : son autorité est rangée dans le profil de ce compte.
+  $CaddyRoot = Join-Path $env:SystemRoot 'System32\config\systemprofile\AppData\Roaming\Caddy\pki\authorities\local\root.crt'
+  $ExportedRoot = Join-Path $CaddyDir 'site-agent-racine.crt'
+  foreach ($Attempt in 1..30) {
+    if (Test-Path $CaddyRoot) { break }
+    Start-Sleep -Seconds 1
+  }
+  if (Test-Path $CaddyRoot) {
+    Copy-Item $CaddyRoot $ExportedRoot -Force
+    Write-Host "Certificat à installer sur chaque PC de l'équipe : $ExportedRoot" -ForegroundColor Yellow
+    Write-Host 'Sans lui, les navigateurs afficheront un avertissement de sécurité. Voir le guide, partie « Réseau local ».'
+  } else {
+    Write-Host "Caddy n'a pas encore créé son certificat. Relancez ce script dans une minute pour le récupérer." -ForegroundColor Yellow
+  }
+}
+
 Write-Step 'Premier administrateur'
 Push-Location $InstallDir
 try { & $Node src\cli.js setup-link } finally { Pop-Location }
 
 Write-Host ''
 Write-Host 'Installation terminée.' -ForegroundColor Green
-Write-Host "Ouvrez le lien ci-dessus depuis votre PC. Si le certificat n'est pas encore prêt, attendez une minute :"
-Write-Host "Caddy l'obtient dès que le nom $Domain pointe vers ce serveur."
+if ($UseInternalTls) {
+  Write-Host 'Installez d''abord le certificat racine sur votre PC, puis ouvrez le lien ci-dessus.'
+} else {
+  Write-Host "Ouvrez le lien ci-dessus depuis votre PC. Si le certificat n'est pas encore prêt, attendez une minute :"
+  Write-Host "Caddy l'obtient dès que le nom $Domain pointe vers ce serveur."
+}
 Write-Host 'Étape suivante : créer la clé de déploiement du compte de service (voir le guide, partie 7).'

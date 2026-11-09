@@ -106,6 +106,42 @@ Dans **Équipe**, invitez chaque personne avec son rôle, puis envoyez-lui le li
 
 Pour la sécurité, gardez **une ou deux personnes au plus** comme administrateurs : ce rôle peut faire exécuter des commandes au serveur.
 
+## Réseau local : serveur sans nom de domaine public
+
+Si l'agent n'est utilisé que sur votre réseau interne, par exemple sur le serveur `10.10.10.18`, les parties 1 et 2 ne s'appliquent pas. Lancez l'installation avec l'adresse IP :
+
+```powershell
+.\deploy\windows\install.ps1 -Address 10.10.10.18
+```
+
+**Ce qui change :**
+- **Certificat :** Let's Encrypt ne délivre pas de certificat pour une adresse privée. Caddy crée donc sa propre autorité de certification et signe lui-même le certificat de l'agent. Le script copie le certificat racine dans `C:\caddy\site-agent-racine.crt`.
+- **Pare-feu :** les ports 80 et 443 ne s'ouvrent qu'au réseau local du serveur (`LocalSubnet`). Si l'équipe passe par un VPN ou un autre sous-réseau, précisez les plages autorisées :
+
+  ```powershell
+  .\deploy\windows\install.ps1 -Address 10.10.10.18 -AllowFrom 10.10.0.0/16, 192.168.50.0/24
+  ```
+
+**Sur chaque PC de l'équipe, une seule fois :** installez le certificat racine. Sans lui, le navigateur affiche « Votre connexion n'est pas privée ».
+
+1. Récupérez `site-agent-racine.crt` depuis le serveur, par un partage réseau ou une clé USB.
+2. Double-cliquez dessus, puis choisissez **Installer le certificat** et **Ordinateur local**.
+3. Choisissez **Placer tous les certificats dans le magasin suivant**, puis **Autorités de certification racines de confiance**.
+
+Ou, dans PowerShell ouvert en administrateur sur le PC :
+
+```powershell
+Import-Certificate -FilePath .\site-agent-racine.crt -CertStoreLocation Cert:\LocalMachine\Root
+```
+
+Chrome et Edge utilisent ce magasin de Windows. **Firefox** a le sien : dans `about:config`, passez `security.enterprise_roots.enabled` à `true`.
+
+Pour l'installer sur tous les PC d'un domaine Active Directory, votre administrateur peut le déployer par stratégie de groupe (GPO).
+
+> **À savoir :** un PC qui fait confiance à cette autorité accepterait tout certificat qu'elle signe. Sa clé privée reste sur le serveur, accessible seulement aux administrateurs de celui-ci. Protégez donc l'accès à ce serveur.
+
+Ensuite, l'agent s'ouvre à **https://10.10.10.18** depuis tout PC du réseau, et la suite du guide (parties 7 à 9) est identique.
+
 ## Au quotidien
 
 | Besoin | Où regarder |
@@ -154,7 +190,8 @@ node src\cli.js backup
 | Symptôme | Cause probable |
 |---|---|
 | Le site `https://agent…` ne répond pas | Le nom de domaine ne pointe pas encore vers le serveur, ou la tâche *Site Agent - Caddy* est arrêtée |
-| Erreur de certificat | Le domaine vient d'être créé : attendez quelques minutes |
+| Erreur de certificat | Domaine public : il vient d'être créé, attendez quelques minutes. Réseau local : le certificat racine n'est pas installé sur ce PC |
+| Le site ne répond pas depuis un PC du réseau | Ce PC n'est pas dans le sous-réseau autorisé : relancez le script avec `-AllowFrom` |
 | « Accès refusé » sur la page | L'adresse utilisée ne correspond pas au domaine passé au script. Relancez le script avec le bon domaine |
 | « Clonage impossible » à l'ajout d'un site | La clé de déploiement n'est pas ajoutée au dépôt, ou l'adresse n'est pas au format SSH |
 | La tâche *Site Agent* ne démarre pas | Mot de passe du compte `site-agent` changé : relancez le script d'installation, il vous le redemandera |
