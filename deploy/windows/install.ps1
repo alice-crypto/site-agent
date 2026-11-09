@@ -14,12 +14,15 @@
     4. déclare l'adresse publique dans agent.defaults.json ;
     5. crée deux tâches planifiées qui démarrent avec le serveur et redémarrent en cas d'arrêt :
        Site Agent (compte dédié) et Site Agent - Caddy (HTTPS) ;
-    6. ouvre les ports 80 et 443 du pare-feu, et seulement ceux-là ;
+    6. ouvre les ports 80 et 443 du pare-feu, et seulement ceux-là (ou le seul port -HttpsPort) ;
     7. démarre le tout et affiche le lien de création du premier administrateur.
 
   Sur un réseau local (adresse IP ou nom interne), Caddy crée ses propres certificats : le script
   fournit alors le certificat racine à installer sur les PC de l'équipe, et n'ouvre le pare-feu
   qu'au réseau local.
+
+  Si IIS ou un autre serveur web occupe déjà les ports 80 et 443, choisissez un autre port avec
+  -HttpsPort : l'agent répondra par exemple sur https://10.10.10.18:8443, sans toucher à IIS.
 
 .EXAMPLE
   .\deploy\windows\install.ps1 -Domain agent.mon-entreprise.fr
@@ -29,6 +32,9 @@
 
 .EXAMPLE
   .\deploy\windows\install.ps1 -Address 10.10.10.18 -AllowFrom 10.10.0.0/16
+
+.EXAMPLE
+  .\deploy\windows\install.ps1 -Address 10.10.10.18 -HttpsPort 8443
 #>
 param(
   [Parameter(Mandatory = $true)]
@@ -41,7 +47,10 @@ param(
   # Nom interne (ex. agent.intranet) qui n'est pas joignable depuis Internet : certificats internes.
   [switch] $Internal,
   # Qui peut joindre l'agent. Par défaut : le réseau local en interne, tout le monde sinon.
-  [string[]] $AllowFrom
+  [string[]] $AllowFrom,
+  # Port HTTPS de l'agent. Changez-le si IIS ou un autre serveur web occupe déjà le port 443.
+  [ValidateRange(1, 65535)]
+  [int] $HttpsPort = 443
 )
 
 $ErrorActionPreference = 'Stop'
@@ -89,7 +98,22 @@ if ($IsIpAddress) {
 # Un certificat public n'est délivré que pour un nom joignable depuis Internet : sinon, Caddy signe lui-même.
 $UseInternalTls = $IsIpAddress -or $Internal -or ($Domain -notmatch '\.')
 if (-not $AllowFrom) { $AllowFrom = if ($UseInternalTls) { @('LocalSubnet') } else { @('Any') } }
-Write-Host "Adresse : https://$Domain (certificat $(if ($UseInternalTls) { 'interne' } else { 'public, Let''s Encrypt' })). Accès autorisé depuis : $($AllowFrom -join ', ')"
+if ($HttpsPort -eq $Port) { throw "Le port HTTPS ne peut pas être celui de l'agent ($Port)." }
+# Let's Encrypt vérifie le domaine sur les ports 80 ou 443 : un autre port n'est possible qu'avec un certificat interne.
+if ($HttpsPort -ne 443 -and -not $UseInternalTls) {
+  throw "-HttpsPort n'est possible qu'en réseau local (adresse IP ou -Internal) : un certificat public exige les ports 80 et 443."
+}
+$PublicUrl = if ($HttpsPort -eq 443) { "https://$Domain" } else { "https://${Domain}:$HttpsPort" }
+# Avec le port standard, Caddy écoute aussi sur le port 80 pour rediriger vers HTTPS.
+$WebPorts = if ($HttpsPort -eq 443) { @(80, 443) } else { @($HttpsPort) }
+$Busy = Get-NetTCPConnection -LocalPort $WebPorts -State Listen -ErrorAction SilentlyContinue |
+  Where-Object { (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName -ne 'caddy' }
+if ($Busy) {
+  $BusyPorts = ($Busy.LocalPort | Sort-Object -Unique) -join ', '
+  $Hint = if ($UseInternalTls) { 'Relancez avec un port libre, par exemple : -HttpsPort 8443' } else { 'Libérez ces ports, ou installez l''agent en réseau local avec -HttpsPort.' }
+  throw "Le port $BusyPorts est déjà utilisé sur ce serveur (souvent par IIS). $Hint"
+}
+Write-Host "Adresse : $PublicUrl (certificat $(if ($UseInternalTls) { 'interne' } else { 'public, Let''s Encrypt' })). Accès autorisé depuis : $($AllowFrom -join ', ')"
 $Node = (Get-Command node -ErrorAction SilentlyContinue).Source
 if (-not $Node) { throw 'Node.js est introuvable. Installez la version LTS depuis https://nodejs.org puis relancez ce script.' }
 $NodeVersion = [version]((& $Node --version).TrimStart('v'))
@@ -127,10 +151,10 @@ Write-Host 'Droits accordés.'
 Write-Step 'Adresse publique'
 $DefaultsPath = Join-Path $InstallDir 'agent.defaults.json'
 $Defaults = Get-Content -Raw -Encoding UTF8 $DefaultsPath | ConvertFrom-Json
-$Ui = [pscustomobject]@{ port = $Port; publicUrl = "https://$Domain" }
+$Ui = [pscustomobject]@{ port = $Port; publicUrl = $PublicUrl }
 if ($Defaults.PSObject.Properties.Name -contains 'ui') { $Defaults.ui = $Ui } else { $Defaults | Add-Member -NotePropertyName ui -NotePropertyValue $Ui }
 [System.IO.File]::WriteAllText($DefaultsPath, ($Defaults | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
-Write-Host "Site Agent répondra sur https://$Domain"
+Write-Host "Site Agent répondra sur $PublicUrl"
 
 Write-Step "Tâche « $AgentTask »"
 $AgentAction = New-ScheduledTaskAction -Execute 'cmd.exe' `
@@ -145,9 +169,11 @@ Write-Step "Tâche « $CaddyTask » (HTTPS)"
 $CaddyDir = Split-Path $CaddyPath
 $Caddyfile = Join-Path $CaddyDir 'Caddyfile'
 if ($UseInternalTls) {
+  # Hors du port 443, Caddy ne doit pas prendre le port 80 pour ses redirections : il peut être à IIS.
+  $GlobalOptions = if ($HttpsPort -eq 443) { '' } else { "{`n`tauto_https disable_redirects`n}`n`n" }
   $CaddyConfig = @"
 # Créé par Site Agent. Réseau local : Caddy signe lui-même le certificat avec sa propre autorité.
-https://$Domain {
+$GlobalOptions$PublicUrl {
 	tls internal
 	encode gzip
 	reverse_proxy 127.0.0.1:$Port
@@ -164,14 +190,18 @@ $Domain {
 }
 [System.IO.File]::WriteAllText($Caddyfile, $CaddyConfig, [System.Text.UTF8Encoding]::new($false))
 $CaddyAction = New-ScheduledTaskAction -Execute $CaddyPath -Argument "run --config `"$Caddyfile`" --adapter caddyfile" -WorkingDirectory $CaddyDir
-# Caddy a besoin des ports 80 et 443 : il tourne sous le compte système, l'agent non.
+# Caddy écoute sur les ports web : il tourne sous le compte système, l'agent non.
 Register-ScheduledTask -TaskName $CaddyTask -Action $CaddyAction -Trigger (New-ServiceTriggers) `
   -Settings (New-ServiceSettings) -User 'NT AUTHORITY\SYSTEM' -RunLevel Highest `
   -Description 'HTTPS pour Site Agent' -Force | Out-Null
 Write-Host "Caddy configuré dans $Caddyfile"
 
-Write-Step 'Pare-feu : ports 80 et 443 uniquement'
-foreach ($FirewallPort in 80, 443) {
+Write-Step "Pare-feu : port$(if ($WebPorts.Count -gt 1) { 's' }) $($WebPorts -join ' et ') uniquement"
+# Une installation précédente sur d'autres ports : ses règles sont retirées.
+Get-NetFirewallRule -DisplayName 'Site Agent - HTTPS (*)' -ErrorAction SilentlyContinue |
+  Where-Object { $_.DisplayName -notin ($WebPorts | ForEach-Object { "Site Agent - HTTPS ($_)" }) } |
+  Remove-NetFirewallRule
+foreach ($FirewallPort in $WebPorts) {
   $RuleName = "Site Agent - HTTPS ($FirewallPort)"
   $Rule = Get-NetFirewallRule -DisplayName $RuleName -ErrorAction SilentlyContinue
   if ($Rule) {

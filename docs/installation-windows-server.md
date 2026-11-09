@@ -53,6 +53,8 @@ git clone https://github.com/alice-crypto/site-agent.git C:\site-agent
 
 Vous pouvez aussi copier le dossier `site-agent` de votre PC vers `C:\site-agent`. Les fichiers se collent directement dans la fenêtre du Bureau à distance.
 
+> **Pas dans `C:\inetpub\wwwroot`.** Ce dossier est publié par IIS : les comptes et l'historique de l'agent risqueraient d'y être téléchargeables. Gardez Site Agent dans `C:\site-agent`.
+
 ## 6. Lancer l'installation
 
 Ouvrez **PowerShell en tant qu'administrateur** : clic droit sur PowerShell, puis *Exécuter en tant qu'administrateur*. Lancez ces commandes, en remplaçant le domaine par le vôtre :
@@ -100,6 +102,24 @@ Le site démarre en **simulation**. Lancez quelques simulations et vérifiez les
 
 **La commande de déploiement** est ce qui publie le site depuis cette copie. Elle dépend de votre hébergement : copie vers un dossier IIS, envoi FTP, script maison… Elle s'exécute sous le compte `site-agent`, qui doit donc avoir les droits nécessaires sur la destination.
 
+**Sites publiés par IIS sur le même serveur.** La commande de déploiement copie la copie de l'agent vers le dossier du site. Par exemple, pour un site dans `C:\inetpub\wwwroot\mon-site` :
+
+```
+robocopy . C:\inetpub\wwwroot\mon-site /MIR /XD .git node_modules /XF web.config /NFL /NDL /NP & if errorlevel 8 (exit 1) else (exit 0)
+```
+
+- `/MIR` rend le dossier du site identique à la copie de l'agent, y compris en supprimant les fichiers en trop. Vérifiez bien le chemin de destination.
+- `/XF web.config` garde la configuration IIS du site intacte. Retirez cette option si `web.config` fait partie de votre dépôt.
+- La fin de la ligne est nécessaire : robocopy renvoie un code de 1 à 7 quand la copie a réussi, ce que l'agent prendrait sinon pour un échec.
+
+Si le site doit d'abord être construit (`npm run build`, par exemple), copiez le dossier produit, comme `dist`, au lieu de `.`.
+
+Donnez une fois au compte `site-agent` le droit d'écrire dans le dossier du site (PowerShell administrateur) :
+
+```powershell
+icacls C:\inetpub\wwwroot\mon-site /grant "site-agent:(OI)(CI)M"
+```
+
 ## 9. Inviter l'équipe
 
 Dans **Équipe**, invitez chaque personne avec son rôle, puis envoyez-lui le lien par un canal privé.
@@ -141,6 +161,16 @@ Pour l'installer sur tous les PC d'un domaine Active Directory, votre administra
 > **À savoir :** un PC qui fait confiance à cette autorité accepterait tout certificat qu'elle signe. Sa clé privée reste sur le serveur, accessible seulement aux administrateurs de celui-ci. Protégez donc l'accès à ce serveur.
 
 Ensuite, l'agent s'ouvre à **https://10.10.10.18** depuis tout PC du réseau, et la suite du guide (parties 7 à 9) est identique.
+
+### Serveur qui héberge déjà des sites avec IIS
+
+IIS occupe les ports 80 et 443, et le script s'arrête s'il les trouve pris. N'arrêtez pas IIS : donnez à l'agent un autre port, par exemple 8443.
+
+```powershell
+.\deploy\windows\install.ps1 -Address 10.10.10.18 -HttpsPort 8443
+```
+
+L'agent s'ouvre alors à **https://10.10.10.18:8443**. Caddy n'écoute que sur ce port, et le pare-feu n'ouvre que celui-là. IIS et vos sites ne sont pas touchés.
 
 ## Au quotidien
 
@@ -191,8 +221,9 @@ node src\cli.js backup
 |---|---|
 | Le site `https://agent…` ne répond pas | Le nom de domaine ne pointe pas encore vers le serveur, ou la tâche *Site Agent - Caddy* est arrêtée |
 | Erreur de certificat | Domaine public : il vient d'être créé, attendez quelques minutes. Réseau local : le certificat racine n'est pas installé sur ce PC |
+| « Le port 80 est déjà utilisé » à l'installation | IIS ou un autre serveur web tourne déjà : relancez avec `-HttpsPort 8443` |
 | Le site ne répond pas depuis un PC du réseau | Ce PC n'est pas dans le sous-réseau autorisé : relancez le script avec `-AllowFrom` |
-| « Accès refusé » sur la page | L'adresse utilisée ne correspond pas au domaine passé au script. Relancez le script avec le bon domaine |
+| « Accès refusé » sur la page | L'adresse utilisée ne correspond pas à celle passée au script, port compris. Relancez le script avec la bonne adresse |
 | « Clonage impossible » à l'ajout d'un site | La clé de déploiement n'est pas ajoutée au dépôt, ou l'adresse n'est pas au format SSH |
 | La tâche *Site Agent* ne démarre pas | Mot de passe du compte `site-agent` changé : relancez le script d'installation, il vous le redemandera |
 | Plus aucun administrateur ne peut se connecter | `node src\cli.js user invite <email>` crée un nouveau lien |

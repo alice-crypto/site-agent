@@ -320,6 +320,16 @@ test('accès : l’adresse publique configurée est acceptée', () =>
     assert.equal(invite.status, 403);
   }, { publicUrl: 'https://agent.example.fr' }));
 
+test('accès : une adresse publique avec un port, derrière IIS par exemple', () =>
+  withUi(async ({ origin, createAdmin }) => {
+    await createAdmin();
+    const withPort = await raw(origin, { path: '/api/session', headers: { host: '10.10.10.18:8443' } });
+    assert.equal(withPort.status, 200);
+    const login = { method: 'POST', path: '/api/login', body: '{}', headers: { host: '10.10.10.18:8443', origin: 'https://10.10.10.18:8443', 'content-type': 'application/json' } };
+    assert.notEqual((await raw(origin, login)).status, 403);
+    assert.equal((await raw(origin, { ...login, headers: { ...login.headers, host: '10.10.10.18', origin: 'https://10.10.10.18' } })).status, 403);
+  }, { publicUrl: 'https://10.10.10.18:8443' }));
+
 test('parcours complet : associer, simuler, passer en réel, valider, retirer', async () => {
   const site = await createSandbox();
   try {
