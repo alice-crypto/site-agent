@@ -19,7 +19,7 @@
         <span id="watch-label">Surveillance arrêtée</span>
       </button>
       <button id="add-site" class="button primary" type="button">Associer un site</button>
-      <button id="team-button" class="button" type="button">Équipe</button>
+      <a id="admin-link" class="button" href="/admin/" hidden>Administration</a>
       <button id="account-button" class="button account" type="button" aria-haspopup="dialog">
         <span id="account-name"></span>
         <span id="account-role" class="account-role"></span>
@@ -92,21 +92,16 @@
   </dialog>
 
   <dialog id="account-dialog" class="dialog dialog-small" aria-labelledby="account-title">
-    <form id="account-form" novalidate>
-      <h2 id="account-title">Mon compte</h2>
-      <p id="account-summary" class="muted"></p>
-      <h3 class="spaced">Changer de mot de passe</h3>
-      <label class="field"><span>Mot de passe actuel</span><input id="account-current" type="password" autocomplete="current-password"></label>
-      <label class="field"><span>Nouveau mot de passe</span><input id="account-next" type="password" autocomplete="new-password" minlength="12"><small>Au moins 12 caractères. Vos autres sessions seront déconnectées.</small></label>
-      <p id="account-error" class="form-error" role="alert" hidden></p>
-      <div class="dialog-actions spread">
-        <button id="logout-button" class="button danger" type="button">Se déconnecter</button>
-        <span class="dialog-actions-group">
-          <button id="account-cancel" class="button" type="button">Fermer</button>
-          <button id="account-submit" class="button primary" type="submit">Changer</button>
-        </span>
-      </div>
-    </form>
+    <h2 id="account-title">Mon compte</h2>
+    <p id="account-summary" class="muted"></p>
+    <p class="muted spaced">Votre mot de passe et votre accès sont gérés par l'administration de Site Agent.</p>
+    <div class="dialog-actions spread">
+      <button id="logout-button" class="button danger" type="button">Se déconnecter</button>
+      <span class="dialog-actions-group">
+        <button id="account-cancel" class="button" type="button">Fermer</button>
+        <a id="account-password" class="button primary" href="/comptes/mot-de-passe/">Changer de mot de passe</a>
+      </span>
+    </div>
   </dialog>
 
   <dialog id="confirm-dialog" class="dialog dialog-small" aria-labelledby="confirm-title">

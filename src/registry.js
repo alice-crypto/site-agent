@@ -130,7 +130,7 @@ export class Registry {
     return deepMerge(DEFAULTS.ui, (await this.#defaults()).ui);
   }
 
-  // Dossier commun à tous les sites : comptes, journal d'audit, lien d'installation.
+  // Dossier commun à tous les sites : état, clé partagée avec l'administration Django.
   dataDir() {
     return path.resolve(this.home, DEFAULTS.stateDir);
   }

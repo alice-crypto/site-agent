@@ -123,6 +123,10 @@ export function settingsView(config) {
     matrix: currentMatrix(config.policy),
     rows: MATRIX_ROWS.map(({ key, group, label, allowNow = false }) => ({ key, group, label, allowNow })),
     hasCustomRules: hasCustomRules(config.policy),
+    advisorEnabled: config.advisor.enabled,
+    advisorModel: config.advisor.model,
+    advisorBaseUrl: config.advisor.baseUrl,
+    advisorOnError: config.advisor.onError,
   };
 }
 
@@ -156,6 +160,18 @@ export function settingsPatch(config, body) {
   update(['policy', 'maxConsecutiveFailures'], config.policy.maxConsecutiveFailures, positiveNumber(body.maxConsecutiveFailures, 'Échecs avant pause'));
   update(['detectors', 'dependencies', 'enabled'], config.detectors.dependencies.enabled, Boolean(body.dependenciesEnabled));
   update(['detectors', 'code', 'enabled'], config.detectors.code.enabled, Boolean(body.codeEnabled));
+
+  if (body.advisorEnabled !== undefined) {
+    const model = String(body.advisorModel ?? config.advisor.model).trim();
+    const baseUrl = String(body.advisorBaseUrl ?? config.advisor.baseUrl).trim();
+    if (!model) throw new Error('Indiquez le modèle Ollama, par exemple qwen2.5:7b.');
+    if (!/^https?:\/\//i.test(baseUrl)) throw new Error(`Adresse d'Ollama invalide : ${baseUrl}`);
+    if (!['rules', 'approval'].includes(body.advisorOnError ?? config.advisor.onError)) throw new Error('Choix invalide si le modèle ne répond pas.');
+    update(['advisor', 'enabled'], config.advisor.enabled, Boolean(body.advisorEnabled));
+    update(['advisor', 'model'], config.advisor.model, model);
+    update(['advisor', 'baseUrl'], config.advisor.baseUrl, baseUrl);
+    update(['advisor', 'onError'], config.advisor.onError, body.advisorOnError ?? config.advisor.onError);
+  }
 
   for (const name of COMMAND_NAMES) {
     const next = body.commands?.[name]?.trim() ?? '';

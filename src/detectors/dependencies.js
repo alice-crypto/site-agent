@@ -47,6 +47,8 @@ export function buildChanges(outdated, audit) {
       title: `${name} ${entry.current} → ${target}${severity ? ` (faille ${severity})` : ''}`,
       updateKind,
       severity,
+      // Titres des avis de sécurité, pour l'analyse IA ; npm donne aussi des noms de paquets dans « via », ignorés ici.
+      advisories: (vulnerabilities[name]?.via ?? []).filter((via) => via?.title).map((via) => via.title).slice(0, 5),
       risk: RISK_BY_KIND[updateKind],
       payload: { kind: 'package', name, target },
     });

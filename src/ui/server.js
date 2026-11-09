@@ -1,10 +1,8 @@
 import { spawn } from 'node:child_process';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { AccountStore, hasRole, publicUser } from '../accounts.js';
 import { Agent } from '../agent.js';
 import { runDaemon } from '../daemon.js';
 import { probe } from '../health.js';
@@ -13,14 +11,12 @@ import { cloneRepository, redactGitUrl } from '../git-clone.js';
 import { associateSite } from '../site-setup.js';
 import { inspectSite } from '../site-inspector.js';
 import { LockBusyError } from '../state.js';
-import { LoginGuard, SessionStore } from './sessions.js';
+import { hasRole, loadProxySecret, verifyIdentity } from './identity.js';
 import { settingsPatch, settingsView } from './settings.js';
 
 export const DEFAULT_UI_PORT = 4310;
 
 const SERVICE = 'site-agent';
-const COOKIE = 'site_agent_session';
-const SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60;
 const MAX_BODY_BYTES = 1024 * 1024;
 const HEALTH_MAX_AGE_MS = 30_000;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
@@ -28,8 +24,6 @@ const PUBLIC_DIR = fileURLToPath(new URL('./public/', import.meta.url));
 const INDEX = ['index.html', 'text/html; charset=utf-8'];
 const STATIC_FILES = {
   '/': INDEX,
-  '/setup': INDEX,
-  '/invite': INDEX,
   '/app.js': ['app.js', 'text/javascript; charset=utf-8'],
   '/style.css': ['style.css', 'text/css; charset=utf-8'],
 };
@@ -40,29 +34,15 @@ const SECURITY_HEADERS = {
   'referrer-policy': 'no-referrer',
   'cache-control': 'no-store',
 };
-// Seuls ces champs entrent dans le journal d'audit : jamais un mot de passe ni un jeton.
-const AUDITED_FIELDS = ['id', 'name', 'email', 'role', 'disabled', 'live', 'simulate', 'enabled', 'dir'];
-const DEMO_USER = { id: 'demo', email: 'demo', name: 'Démo', role: 'admin', disabled: false, sessionVersion: 0 };
+// Seuls ces champs entrent dans le journal d'audit : jamais un secret.
+const AUDITED_FIELDS = ['id', 'name', 'live', 'simulate', 'enabled', 'dir'];
+const DEMO_USER = { id: 'demo', name: 'Démo', role: 'admin' };
 
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
     this.status = status;
   }
-}
-
-function sameToken(a, b) {
-  const left = Buffer.from(String(a ?? ''));
-  const right = Buffer.from(String(b ?? ''));
-  return left.length === right.length && timingSafeEqual(left, right);
-}
-
-function readCookie(request) {
-  for (const part of (request.headers.cookie ?? '').split(';')) {
-    const [key, value] = part.trim().split('=');
-    if (key === COOKIE) return value;
-  }
-  return null;
 }
 
 function readBody(request) {
@@ -97,7 +77,7 @@ export function openInBrowser(url) {
   spawn(command, args, { detached: true, stdio: 'ignore' }).on('error', () => {}).unref();
 }
 
-// Vrai si le port est occupé par cette interface : un lien d'installation ne doit jamais partir vers une autre application.
+// Vrai si le port est occupé par cette interface et non par une autre application.
 export async function isUiRunning(port) {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/api/session`, { signal: AbortSignal.timeout(2000) });
@@ -107,39 +87,25 @@ export async function isUiRunning(port) {
   }
 }
 
-// Le lien d'installation ne sert qu'à créer le premier administrateur, puis il est détruit.
-export async function loadSetupToken(dataDir) {
-  const file = path.join(dataDir, 'ui-token');
-  const existing = (await readFile(file, 'utf8').catch(() => '')).trim();
-  if (existing) return existing;
-  const token = randomBytes(24).toString('hex');
-  await mkdir(dataDir, { recursive: true });
-  await writeFile(file, token, { mode: 0o600 });
-  return token;
-}
-
-// requireAuth à false est réservé à la démo, dont les sites sont factices.
+// Les comptes sont ceux de l'administration Django, qui sert seule l'interface et signe l'identité de chaque requête.
+// requireAuth à false est réservé à la démo, dont les sites sont factices : tout le monde y est administrateur.
 export async function createUiServer(
   registry,
   {
     host = '127.0.0.1',
     port = DEFAULT_UI_PORT,
-    publicUrl = null,
     log = console.log,
     requireAuth = true,
     now = () => new Date(),
     sitesRoot = path.join(registry.home, 'checkouts'),
     gitProtocols = ['https', 'ssh'],
+    // Options passées à chaque agent : la démo y branche une analyse IA simulée.
+    agentOptions = {},
   } = {},
 ) {
   const dataDir = registry.dataDir();
   const watchFile = path.join(dataDir, 'watch.json');
-  const accounts = new AccountStore(dataDir, { now });
-  const sessions = new SessionStore({ now });
-  const guard = new LoginGuard({ now });
-  const auditFile = path.join(dataDir, 'audit.jsonl');
-  const publicHost = publicUrl ? new URL(publicUrl).host : null;
-  let setupToken = requireAuth && (await accounts.count()) === 0 ? await loadSetupToken(dataDir) : null;
+  const secret = requireAuth ? await loadProxySecret(dataDir) : null;
 
   const reports = new Map();
   const healthCache = new Map();
@@ -151,10 +117,10 @@ export async function createUiServer(
   /* Contrôles d'accès */
 
   // Bloque un site malveillant qui viserait ce serveur, directement ou par un nom de domaine piégé.
+  // Seul Django, sur la même machine, s'adresse à l'agent.
   function isAllowedRequest(request) {
     const requestHost = request.headers.host ?? '';
-    const allowed = LOCAL_HOSTS.has(requestHost.replace(/:\d+$/, '')) || (publicHost && requestHost === publicHost);
-    if (!allowed) return false;
+    if (!LOCAL_HOSTS.has(requestHost.replace(/:\d+$/, ''))) return false;
     const origin = request.headers.origin;
     if (!origin) return true;
     try {
@@ -164,41 +130,8 @@ export async function createUiServer(
     }
   }
 
-  function baseUrl(request) {
-    return publicUrl ?? `http://${request.headers.host}`;
-  }
-
-  function sessionCookie(request, token, maxAge = SESSION_MAX_AGE_SECONDS) {
-    const secure = request.headers['x-forwarded-proto'] === 'https' || publicUrl?.startsWith('https:');
-    return `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${maxAge}${secure ? '; Secure' : ''}`;
-  }
-
-  async function currentUser(request) {
-    if (!requireAuth) return DEMO_USER;
-    const session = sessions.resolve(readCookie(request));
-    if (!session) return null;
-    const user = await accounts.get(session.userId);
-    // Un compte désactivé, ou dont le mot de passe a changé, perd ses sessions immédiatement.
-    if (!user || user.disabled || user.sessionVersion !== session.version) {
-      sessions.destroy(readCookie(request));
-      return null;
-    }
-    return user;
-  }
-
-  function openSession(response, request, user) {
-    sessions.destroy(readCookie(request));
-    response.setHeader('set-cookie', sessionCookie(request, sessions.create(user)));
-  }
-
-  async function audit(user, action, details, outcome) {
-    const entry = { at: now().toISOString(), user: user?.email ?? null, action, outcome, ...details };
-    try {
-      await mkdir(dataDir, { recursive: true });
-      await appendFile(auditFile, `${JSON.stringify(entry)}\n`);
-    } catch (error) {
-      log(`Journal d'audit indisponible : ${error.message}`);
-    }
+  function currentUser(request) {
+    return requireAuth ? verifyIdentity(request, secret, now().getTime()) : DEMO_USER;
   }
 
   /* Sites */
@@ -250,7 +183,7 @@ export async function createUiServer(
     if (simulate) config.dryRun = true;
     busy.add(name);
     try {
-      return await new Agent(config, { onReport: remember }).runCycle();
+      return await new Agent(config, { ...agentOptions, onReport: remember }).runCycle();
     } finally {
       busy.delete(name);
     }
@@ -259,7 +192,7 @@ export async function createUiServer(
   function setWatching(enabled) {
     if (enabled && !watcher) {
       const controller = new AbortController();
-      const done = runDaemon(registry, { signal: controller.signal, log, agentOptions: { onReport: remember } });
+      const done = runDaemon(registry, { signal: controller.signal, log, agentOptions: { ...agentOptions, onReport: remember } });
       watcher = { controller, done };
     }
     if (!enabled && watcher) {
@@ -303,75 +236,10 @@ export async function createUiServer(
 
   const agentFor = async (name) => new Agent(await registry.load(name));
 
-  /* Comptes */
-
-  async function login({ body, request, response }) {
-    const email = String(body.email ?? '').trim().toLowerCase();
-    if (guard.isLocked(email)) throw new HttpError(429, 'Trop de tentatives. Réessayez dans 15 minutes.');
-    const user = await accounts.authenticate(email, body.password);
-    if (!user) {
-      guard.fail(email);
-      throw new HttpError(401, 'E-mail ou mot de passe incorrect.');
-    }
-    guard.reset(email);
-    openSession(response, request, user);
-    return { user: publicUser(user) };
-  }
-
-  async function inviteLink(request, token) {
-    return `${baseUrl(request)}/invite?token=${token}`;
-  }
-
   /* Routes : [méthode, chemin, rôle minimal ou 'public', action, action d'audit] */
   const routes = [
-    ['GET', /^\/api\/session$/, 'public', async ({ user }) => ({
-      service: SERVICE,
-      demo: !requireAuth,
-      setupRequired: Boolean(setupToken),
-      user: user ? publicUser(user) : null,
-    })],
-    ['POST', /^\/api\/login$/, 'public', login, 'login'],
-    ['POST', /^\/api\/logout$/, 'public', async ({ request, response }) => {
-      sessions.destroy(readCookie(request));
-      response.setHeader('set-cookie', sessionCookie(request, '', 0));
-      return {};
-    }],
-    ['POST', /^\/api\/setup$/, 'public', async ({ body, request, response }) => {
-      if (!setupToken || !sameToken(body.token, setupToken)) throw new HttpError(403, "Lien d'installation invalide ou déjà utilisé.");
-      const user = await accounts.createFirstAdmin(body);
-      setupToken = null;
-      await rm(path.join(dataDir, 'ui-token'), { force: true });
-      openSession(response, request, user);
-      return { user: publicUser(user) };
-    }, 'setup'],
-    ['POST', /^\/api\/invite\/check$/, 'public', async ({ body }) => ({ user: await accounts.checkInvite(body.token) })],
-    ['POST', /^\/api\/invite\/accept$/, 'public', async ({ body, request, response }) => {
-      const user = await accounts.acceptInvite(body.token, body.password);
-      sessions.destroyUser(user.id);
-      openSession(response, request, user);
-      return { user: publicUser(user) };
-    }, 'invite.accept'],
-    ['POST', /^\/api\/me\/password$/, 'viewer', async ({ user, body, request, response }) => {
-      const updated = await accounts.changePassword(user.id, body.current, body.next);
-      sessions.destroyUser(user.id);
-      openSession(response, request, updated);
-      return {};
-    }, 'password.change'],
-
-    ['GET', /^\/api\/users$/, 'admin', async () => ({ users: await accounts.list() })],
-    ['POST', /^\/api\/users$/, 'admin', async ({ body, request }) => {
-      const { user, token } = await accounts.invite(body);
-      return { user, inviteUrl: await inviteLink(request, token) };
-    }, 'user.invite'],
-    ['POST', /^\/api\/users\/([^/]+)$/, 'admin', async ({ params: [id], body }) => {
-      const user = await accounts.update(id, { role: body.role, disabled: body.disabled });
-      if (user.disabled) sessions.destroyUser(id);
-      return { user };
-    }, 'user.update'],
-    ['POST', /^\/api\/users\/([^/]+)\/invite$/, 'admin', async ({ params: [id], request }) => {
-      const { user, token } = await accounts.reinvite(id);
-      return { user, inviteUrl: await inviteLink(request, token) };
-    }, 'user.reinvite'],
+    // En service, Django répond lui-même à /api/session : cette route ne sert qu'à la démo et aux vérifications.
+    ['GET', /^\/api\/session$/, 'public', async ({ user }) => ({ service: SERVICE, demo: !requireAuth, user })],
 
     ['GET', /^\/api\/sites$/, 'viewer', async () => ({
       watching: Boolean(watcher),
@@ -444,7 +312,7 @@ export async function createUiServer(
       body = await readBody(request);
     }
 
-    const user = await currentUser(request);
+    const user = currentUser(request);
     // Le rôle est vérifié ici, côté serveur : masquer un bouton dans l'interface ne suffirait pas.
     if (role !== 'public') {
       if (!user) throw new HttpError(401, 'Connectez-vous pour continuer.');
@@ -454,14 +322,22 @@ export async function createUiServer(
     const params = pattern.exec(pathname).slice(1).map(decodeURIComponent);
     const details = Object.fromEntries(AUDITED_FIELDS.filter((key) => body[key] !== undefined).map((key) => [key, body[key]]));
     if (body.gitUrl) details.gitUrl = redactGitUrl(body.gitUrl);
-    if (params.length) details.target = params[0];
 
+    // Le journal d'audit est tenu par Django, dans la base de données : l'agent lui décrit l'action.
+    const describe = (outcome) => {
+      if (!auditAction) return;
+      const target = params[0] ?? '';
+      response.setHeader('x-site-agent-audit', auditAction);
+      response.setHeader('x-site-agent-audit-outcome', encodeURIComponent(outcome));
+      response.setHeader('x-site-agent-audit-target', encodeURIComponent(target));
+      response.setHeader('x-site-agent-audit-details', encodeURIComponent(JSON.stringify(details)));
+    };
     try {
       const result = await handler({ params, body, user, request, response });
-      if (auditAction) await audit(user ?? { email: details.email ?? null }, auditAction, details, 'ok');
+      describe('ok');
       sendJson(response, 200, result);
     } catch (error) {
-      if (auditAction) await audit(user ?? { email: String(body.email ?? '') || null }, auditAction, details, `refusé : ${error.message}`);
+      describe(`refusé : ${error.message}`);
       throw error;
     }
   }
@@ -500,13 +376,7 @@ export async function createUiServer(
     });
   });
 
-  function urls(origin) {
-    const entry = publicUrl ?? origin;
-    return { origin, loginUrl: setupToken ? `${entry}/setup?token=${setupToken}` : entry };
-  }
-
   return {
-    accounts,
     listen() {
       return new Promise((resolve, reject) => {
         server.once('error', reject);
@@ -516,12 +386,10 @@ export async function createUiServer(
             setWatching(true);
             log('Surveillance reprise, comme avant le dernier arrêt.');
           }
-          resolve(urls(`http://${host}:${activePort}`));
+          resolve({ origin: `http://${host}:${activePort}` });
         });
       });
     },
-    // Adresse à ouvrir quand une autre instance occupe déjà le port.
-    urlsOn: (otherPort) => urls(`http://${host}:${otherPort}`),
     async close() {
       await setWatching(false);
       server.closeAllConnections();

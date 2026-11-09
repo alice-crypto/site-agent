@@ -43,8 +43,19 @@ export const DEFAULTS = {
     incident: { enabled: true, failuresBeforeAction: 3, cooldownMinutes: 30, maxPerDay: 3 },
   },
   policy: { default: 'approval', maxAutoPerDay: 5, maxConsecutiveFailures: 2, rules: [] },
+  // Analyse de chaque mise à jour par un modèle de langage local (LangChain + Ollama). Elle ne peut que rendre plus prudent.
+  advisor: {
+    enabled: false,
+    provider: 'ollama',
+    model: 'qwen2.5:7b',
+    baseUrl: 'http://127.0.0.1:11434',
+    timeoutSeconds: 120,
+    maxDiffChars: 12000,
+    // Si le modèle ne répond pas : « rules » décide avec les règles seules, « approval » exige une validation.
+    onError: 'rules',
+  },
   webhook: { enabled: false, host: '127.0.0.1', port: 8787, secretEnv: 'SITE_AGENT_WEBHOOK_SECRET' },
-  ui: { port: 4310, publicUrl: null },
+  ui: { port: 4310, webPort: 8000, publicUrl: null },
   notify: { webhookUrlEnv: 'SITE_AGENT_NOTIFY_WEBHOOK' },
 };
 
@@ -106,6 +117,15 @@ export function normalizeConfig(raw, baseDir = process.cwd()) {
       errors.push(`Gel ${index + 1} : dates invalides`);
     }
   });
+
+  const { advisor } = config;
+  if (advisor.provider !== 'ollama') errors.push(`advisor.provider invalide : ${advisor.provider} (seul ollama est pris en charge)`);
+  if (typeof advisor.model !== 'string' || !advisor.model.trim()) errors.push('advisor.model manquant');
+  if (!/^https?:\/\//.test(String(advisor.baseUrl))) errors.push(`advisor.baseUrl doit être une adresse http(s) : ${advisor.baseUrl}`);
+  if (!['rules', 'approval'].includes(advisor.onError)) errors.push(`advisor.onError invalide : ${advisor.onError}`);
+  for (const key of ['timeoutSeconds', 'maxDiffChars']) {
+    if (!(Number.isFinite(advisor[key]) && advisor[key] > 0)) errors.push(`advisor.${key} doit être un nombre positif`);
+  }
 
   if (errors.length) throw new Error(`Configuration invalide :\n- ${errors.join('\n- ')}`);
 

@@ -35,13 +35,23 @@ Sur votre PC, ouvrez **Connexion Bureau à distance** (tapez `mstsc` dans le men
 
 Toutes les étapes suivantes se font sur le serveur.
 
-## 4. Installer les trois logiciels nécessaires
+## 4. Installer les logiciels nécessaires
 
 | Logiciel | Où le trouver | Remarque |
 |---|---|---|
 | **Node.js** (version LTS) | https://nodejs.org | Gardez les options par défaut |
 | **Git for Windows** | https://git-scm.com | Gardez les options par défaut |
+| **Python** 3.11 ou plus récent | https://www.python.org | Cochez « Add python.exe to PATH » |
+| **PostgreSQL** | https://www.postgresql.org/download/windows | Inutile s'il est déjà installé, ou si la base est sur un autre serveur |
 | **Caddy** | https://caddyserver.com/download | Choisissez *Windows amd64*. Renommez le fichier `caddy.exe` et placez-le dans `C:\caddy\` |
+| **Ollama** (facultatif) | https://ollama.com/download | Seulement pour l'analyse IA des mises à jour, voir plus bas |
+
+**La base de données des comptes.** Dans pgAdmin, connecté en `postgres`, ouvrez une fenêtre de requête et exécutez, avec un mot de passe de votre choix :
+
+```sql
+CREATE ROLE site_agent LOGIN PASSWORD 'choisissez-un-mot-de-passe';
+CREATE DATABASE site_agent OWNER site_agent;
+```
 
 ## 5. Copier Site Agent sur le serveur
 
@@ -57,6 +67,12 @@ Vous pouvez aussi copier le dossier `site-agent` de votre PC vers `C:\site-agent
 
 ## 6. Lancer l'installation
 
+Copiez `C:\site-agent\webadmin\.env.example` en `C:\site-agent\webadmin\.env`, puis ouvrez-le dans le Bloc-notes et indiquez la base :
+
+```
+DATABASE_URL=postgres://site_agent:choisissez-un-mot-de-passe@127.0.0.1:5432/site_agent
+```
+
 Ouvrez **PowerShell en tant qu'administrateur** : clic droit sur PowerShell, puis *Exécuter en tant qu'administrateur*. Lancez ces commandes, en remplaçant le domaine par le vôtre :
 
 ```powershell
@@ -67,7 +83,7 @@ Set-ExecutionPolicy -Scope Process Bypass
 
 Le script vous demande de choisir un mot de passe pour le compte Windows `site-agent`. C'est ce compte qui fait tourner l'agent, sans droits d'administrateur. Choisissez un mot de passe long, puis notez-le dans votre gestionnaire de mots de passe.
 
-À la fin, le script affiche un **lien d'installation**. Ouvrez-le depuis votre PC pour créer votre compte administrateur. Ce lien ne sert qu'une fois.
+Le script installe ensuite les dépendances de l'agent et de l'administration, et crée les tables dans PostgreSQL. À la fin, il vous demande l'identifiant, l'e-mail et le mot de passe de votre **compte administrateur**.
 
 > Si le navigateur signale un problème de certificat, attendez une ou deux minutes. Caddy obtient le certificat dès que le nom de domaine pointe vers le serveur (partie 2).
 
@@ -121,9 +137,9 @@ $Sid = (Get-LocalUser site-agent).SID.Value
 icacls C:\inetpub\wwwroot\mon-site /grant "*${Sid}:(OI)(CI)M"
 ```
 
-## 9. Inviter l'équipe
+## 9. Ajouter l'équipe
 
-Dans **Équipe**, invitez chaque personne avec son rôle, puis envoyez-lui le lien par un canal privé.
+Cliquez sur **Administration**, en haut de l'interface, puis sur **Comptes → Ajouter**. Créez le compte de chaque personne, puis ajoutez-la à un groupe : **Lecteurs**, **Opérateurs** ou **Administrateurs**. Transmettez-lui son mot de passe provisoire par un canal privé : elle le change ensuite dans **Mon compte**.
 
 Pour la sécurité, gardez **une ou deux personnes au plus** comme administrateurs : ce rôle peut faire exécuter des commandes au serveur.
 
@@ -173,14 +189,31 @@ IIS occupe les ports 80 et 443, et le script s'arrête s'il les trouve pris. N'a
 
 L'agent s'ouvre alors à **https://10.10.10.18:8443**. Caddy n'écoute que sur ce port, et le pare-feu n'ouvre que celui-là. IIS et vos sites ne sont pas touchés.
 
+## Analyse IA des mises à jour (facultatif)
+
+L'agent peut faire relire chaque mise à jour par un modèle de langage qui tourne sur le serveur, gratuitement, avec Ollama. Le modèle ne peut que rendre l'agent plus prudent : il ne débloque jamais ce que les règles retiennent.
+
+1. Installez Ollama sur le serveur.
+2. Téléchargez le modèle, environ 4,7 Go :
+
+   ```powershell
+   ollama pull qwen2.5:7b
+   ```
+
+3. Dans l'interface, ouvrez un site, puis **Règles et facteurs → Analyse IA**, et cochez **Analyser chaque mise à jour**.
+
+Comptez au moins 8 Go de mémoire libre. Sans carte graphique, une analyse prend de quelques secondes à une minute.
+
 ## Au quotidien
 
 | Besoin | Où regarder |
 |---|---|
 | L'agent tourne-t-il ? | Planificateur de tâches → *Site Agent* (état « En cours d'exécution ») |
 | Journal de l'agent | `C:\site-agent\logs\agent.log` |
-| Qui a fait quoi | `C:\site-agent\.site-agent\audit.jsonl` |
+| Qui a fait quoi | **Administration → Journal d'audit** |
 | Sauvegardes | `C:\site-agent\backups\` : une par jour, les 14 dernières sont gardées |
+
+**La base des comptes et du journal** est dans PostgreSQL : sauvegardez-la avec vos outils habituels, par exemple `pg_dump`.
 
 **Sauvegardes hors du serveur :** copiez régulièrement le dossier `backups` ailleurs. Une sauvegarde restée sur le serveur ne protège pas contre la perte du serveur.
 
@@ -197,9 +230,8 @@ L'agent s'ouvre alors à **https://10.10.10.18:8443**. Caddy n'écoute que sur c
 **Commandes de secours** (PowerShell administrateur, dans `C:\site-agent`) :
 
 ```powershell
-node src\cli.js user list
-node src\cli.js user invite admin@votre-domaine.fr
-node src\cli.js setup-link
+webadmin\.venv\Scripts\python webadmin\manage.py createsuperuser
+webadmin\.venv\Scripts\python webadmin\manage.py changepassword <identifiant>
 node src\cli.js backup
 ```
 
@@ -214,7 +246,8 @@ node src\cli.js backup
 - **Ports ouverts :** n'ouvrez que les ports 80 et 443 au public, le script ne fait rien d'autre. Le port de l'agent (4310) reste fermé.
 - **Bureau à distance :** si votre hébergeur le permet, limitez-le à votre adresse IP, et utilisez un mot de passe administrateur long.
 - **Mises à jour Windows :** laissez-les activées.
-- **Le dossier `.site-agent` :** il contient les comptes, sous forme d'empreintes et jamais de mots de passe en clair. Le script en réserve l'accès au compte de service et aux administrateurs.
+- **Le dossier `.site-agent` :** il contient la clé partagée entre Django et l'agent. Le script en réserve l'accès au compte de service et aux administrateurs.
+- **Le fichier `webadmin\.env` :** il contient le mot de passe de la base. Ne le copiez pas ailleurs, il n'est jamais envoyé sur GitHub.
 
 ## Dépannage
 
@@ -227,4 +260,6 @@ node src\cli.js backup
 | « Accès refusé » sur la page | L'adresse utilisée ne correspond pas à celle passée au script, port compris. Relancez le script avec la bonne adresse |
 | « Clonage impossible » à l'ajout d'un site | La clé de déploiement n'est pas ajoutée au dépôt, ou l'adresse n'est pas au format SSH |
 | La tâche *Site Agent* ne démarre pas | Mot de passe du compte `site-agent` changé : relancez le script d'installation, il vous le redemandera |
-| Plus aucun administrateur ne peut se connecter | `node src\cli.js user invite <email>` crée un nouveau lien |
+| Plus aucun administrateur ne peut se connecter | `webadmin\.venv\Scripts\python webadmin\manage.py createsuperuser` |
+| « Base PostgreSQL inaccessible » à l'installation | `DATABASE_URL` est incorrect dans `webadmin\.env`, ou PostgreSQL est arrêté |
+| « Analyse IA indisponible » sur une mise à jour | Ollama est arrêté, ou le modèle n'a pas été téléchargé (`ollama list`) |

@@ -1,0 +1,4 @@
+-r production.txt
+pytest>=8.3,<9
+pytest-django>=4.9,<5
+factory-boy>=3.3,<4

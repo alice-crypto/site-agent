@@ -1,182 +1,71 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, request as httpRequest } from 'node:http';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { fileURLToPath } from 'node:url';
 import { createSandbox } from '../demo/sandbox.js';
-import { AccountStore, hashPassword, verifyPassword } from '../src/accounts.js';
 import { normalizeConfig } from '../src/config.js';
 import { Registry } from '../src/registry.js';
-import { createUiServer } from '../src/ui/server.js';
+import { identityHeaders, loadProxySecret } from '../src/ui/identity.js';
+import { createUiServer, isUiRunning } from '../src/ui/server.js';
 import { settingsPatch, settingsView } from '../src/ui/settings.js';
+import { raw, signedClient } from './support.js';
 
-const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
-const PASSWORD = 'un mot de passe solide';
 const DEFAULTS = {
   health: { samples: 1, intervalMs: 0, settleSeconds: 0, maxP95LatencyMs: 5000 },
   detectors: { code: { sensitivePaths: ['^migrations/'] } },
   policy: { rules: [{ name: 'Petit code', when: { type: 'code', risk: 'low' }, action: 'auto' }] },
 };
 
-// Passe par http.request : fetch interdit de choisir les en-têtes Host et Origin, or ce sont eux qu'on teste.
-function raw(origin, { method = 'GET', path: target = '/', headers = {}, body } = {}) {
-  return new Promise((resolve, reject) => {
-    const request = httpRequest(`${origin}${target}`, { method, headers }, (response) => {
-      let text = '';
-      response.on('data', (chunk) => { text += chunk; });
-      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, text }));
-    });
-    request.on('error', reject);
-    request.end(body);
-  });
-}
-
-function cookieFrom(response) {
-  return response.headers['set-cookie']?.[0]?.split(';')[0] ?? null;
-}
-
+// L'agent tel que Django le voit : chaque personne est un client qui signe son identité avec la clé partagée.
 async function withUi(scenario, options = {}) {
   const home = mkdtempSync(path.join(tmpdir(), 'site-agent-ui-'));
   writeFileSync(path.join(home, 'agent.defaults.json'), JSON.stringify(DEFAULTS));
   const registry = new Registry(home);
   const server = await createUiServer(registry, { port: 0, log: () => {}, ...options });
-  const { origin, loginUrl } = await server.listen();
-
-  // Un client garde son cookie de session, comme un navigateur.
-  const client = (cookie = null) => {
-    const state = { cookie };
-    const call = async (method, target, body, headers = {}) => {
-      const response = await raw(origin, {
-        method,
-        path: `/api${target}`,
-        headers: {
-          ...(state.cookie ? { cookie: state.cookie } : {}),
-          ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-          ...headers,
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      const fresh = cookieFrom(response);
-      if (fresh) state.cookie = fresh;
-      let json = {};
-      try {
-        json = JSON.parse(response.text || '{}');
-      } catch {
-        json = { text: response.text };
-      }
-      return { status: response.status, json, headers: response.headers };
-    };
-    call.state = state;
-    return call;
-  };
-
-  const setupToken = new URL(loginUrl).searchParams.get('token');
-  const admin = client();
-  const createAdmin = async () => {
-    const result = await admin('POST', '/setup', { token: setupToken, name: 'Alice', email: 'alice@example.com', password: PASSWORD });
-    assert.equal(result.status, 200, JSON.stringify(result.json));
-    return admin;
-  };
-
-  // Invite puis active un compte du rôle demandé, et renvoie son client connecté.
-  const member = async (role, email = `${role}@example.com`) => {
-    const { json } = await admin('POST', '/users', { email, name: role, role });
-    const token = new URL(json.inviteUrl).searchParams.get('token');
-    const person = client();
-    const accepted = await person('POST', '/invite/accept', { token, password: PASSWORD });
-    assert.equal(accepted.status, 200, JSON.stringify(accepted.json));
-    person.id = json.user.id;
-    return person;
-  };
-
+  const { origin } = await server.listen();
+  const secret = options.requireAuth === false ? null : readFileSync(path.join(registry.dataDir(), 'proxy-secret'), 'utf8');
+  const as = (role, username = role) => signedClient(origin, secret, { username, name: `Nom ${username}`, role });
   try {
-    await scenario({ origin, loginUrl, setupToken, registry, client, admin, createAdmin, member, server });
+    await scenario({ origin, secret, registry, as, admin: as('admin', 'alice'), server });
   } finally {
     await server.close();
     rmSync(home, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
 }
 
-test('comptes : empreinte de mot de passe sûre', async () => {
-  const stored = await hashPassword(PASSWORD);
-  assert.match(stored, /^scrypt\$/);
-  assert.ok(!stored.includes(PASSWORD));
-  assert.equal(await verifyPassword(PASSWORD, stored), true);
-  assert.equal(await verifyPassword('autre chose encore', stored), false);
-  assert.notEqual(await hashPassword(PASSWORD), stored, 'chaque empreinte a son propre sel');
-});
+test('identité : sans signature valide de Django, rien n’est accessible', () =>
+  withUi(async ({ origin, secret, admin }) => {
+    assert.equal((await admin('GET', '/sites')).status, 200);
+    assert.equal((await raw(origin, { path: '/api/sites' })).status, 401, 'sans en-têtes');
 
-test('installation : le premier administrateur se crée une seule fois, avec le lien', () =>
-  withUi(async ({ client, setupToken, registry, admin }) => {
-    const anonymous = client();
-    assert.equal((await anonymous('GET', '/session')).json.setupRequired, true);
-    assert.equal((await anonymous('POST', '/setup', { token: 'faux', email: 'x@y.fr', password: PASSWORD })).status, 403);
-    assert.equal((await anonymous('POST', '/setup', { token: setupToken, email: 'x@y.fr', password: 'court' })).status, 400);
+    const forged = signedClient(origin, 'une-autre-cle', { username: 'eve', role: 'admin' });
+    assert.equal((await forged('GET', '/sites')).status, 401, 'mauvaise clé');
 
-    const created = await admin('POST', '/setup', { token: setupToken, name: 'Alice', email: 'alice@example.com', password: PASSWORD });
-    assert.equal(created.status, 200);
-    assert.equal(created.json.user.role, 'admin');
-    assert.equal((await admin('GET', '/session')).json.user.email, 'alice@example.com');
-    assert.equal(existsSync(path.join(registry.dataDir(), 'ui-token')), false, 'le lien d’installation est détruit');
+    const late = signedClient(origin, secret, { username: 'eve', role: 'admin' }, { now: () => Date.now() - 5 * 60_000 });
+    assert.equal((await late('GET', '/sites')).status, 401, 'signature trop ancienne : pas de rejeu');
 
-    assert.equal((await client()('POST', '/setup', { token: setupToken, email: 'eve@y.fr', password: PASSWORD })).status, 403);
-    assert.equal((await client()('GET', '/session')).json.setupRequired, false);
-
-    const users = JSON.parse(readFileSync(path.join(registry.dataDir(), 'users.json'), 'utf8'));
-    assert.ok(!JSON.stringify(users).includes(PASSWORD), 'aucun mot de passe en clair sur le disque');
+    const session = JSON.parse((await raw(origin, { path: '/api/session' })).text);
+    assert.equal(session.user, null, 'sans identité, personne n’est connecté');
   }));
 
-test('connexion : bon et mauvais mot de passe, déconnexion', () =>
-  withUi(async ({ client, createAdmin }) => {
-    await createAdmin();
-    const person = client();
-    assert.equal((await person('GET', '/sites')).status, 401);
-    const wrong = await person('POST', '/login', { email: 'alice@example.com', password: 'mauvais mot de passe' });
-    assert.equal(wrong.status, 401);
-    const unknown = await person('POST', '/login', { email: 'inconnu@example.com', password: PASSWORD });
-    assert.equal(unknown.json.error, wrong.json.error, 'même message : on ne révèle pas quels comptes existent');
-
-    const ok = await person('POST', '/login', { email: 'ALICE@example.com ', password: PASSWORD });
-    assert.equal(ok.status, 200);
-    const header = ok.headers['set-cookie'][0];
-    assert.match(header, /HttpOnly/);
-    assert.match(header, /SameSite=Strict/);
-    assert.doesNotMatch(header, /Secure/);
-    assert.equal((await person('GET', '/sites')).status, 200);
-
-    const stolen = person.state.cookie;
-    await person('POST', '/logout', {});
-    assert.equal((await client(stolen)('GET', '/sites')).status, 401, 'la session est détruite côté serveur');
-  }));
-
-test('connexion : cookie Secure derrière HTTPS', () =>
-  withUi(async ({ client, createAdmin }) => {
-    await createAdmin();
-    const response = await client()('POST', '/login', { email: 'alice@example.com', password: PASSWORD }, { 'x-forwarded-proto': 'https' });
-    assert.match(response.headers['set-cookie'][0], /Secure/);
-  }));
-
-test('connexion : blocage après 5 échecs, même avec le bon mot de passe', () =>
-  withUi(async ({ client, createAdmin }) => {
-    await createAdmin();
-    const attacker = client();
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      assert.equal((await attacker('POST', '/login', { email: 'alice@example.com', password: `essai ${attempt} raté` })).status, 401);
-    }
-    assert.equal((await attacker('POST', '/login', { email: 'alice@example.com', password: PASSWORD })).status, 429);
+test('identité : modifier le rôle ou l’adresse après signature est refusé', () =>
+  withUi(async ({ origin, secret }) => {
+    const headers = identityHeaders(secret, { method: 'GET', url: '/api/sites', username: 'bob', name: 'Bob', role: 'viewer' });
+    assert.equal((await raw(origin, { path: '/api/sites', headers })).status, 200);
+    assert.equal((await raw(origin, { path: '/api/sites', headers: { ...headers, 'x-site-agent-role': 'admin' } })).status, 401);
+    assert.equal((await raw(origin, { path: '/api/sites/x/settings', headers })).status, 401);
+    const post = { method: 'POST', path: '/api/sites', headers: { ...headers, 'content-type': 'application/json' }, body: '{}' };
+    assert.equal((await raw(origin, post)).status, 401, 'une signature de lecture ne vaut pas pour une écriture');
   }));
 
 test('rôles : chacun ne peut faire que ce que son rôle permet, côté serveur', async () => {
   const site = await createSandbox();
   try {
-    await withUi(async ({ createAdmin, member }) => {
-      const admin = await createAdmin();
+    await withUi(async ({ as, admin }) => {
       assert.equal((await admin('POST', '/sites', { name: 'alpha', dir: site.siteDir, urls: [site.config.health.urls[0]] })).status, 200);
-      const viewer = await member('viewer');
-      const operator = await member('operator');
+      const viewer = as('viewer');
+      const operator = as('operator');
       const settings = (await admin('GET', '/sites/alpha/settings')).json;
 
       const expectations = [
@@ -190,8 +79,6 @@ test('rôles : chacun ne peut faire que ce que son rôle permet, côté serveur'
         ['POST', '/sites/alpha/mode', { live: false }, 403, 403, 200],
         ['POST', '/inspect', { dir: site.siteDir }, 403, 403, 200],
         ['POST', '/watch', { enabled: false }, 403, 403, 200],
-        ['GET', '/users', undefined, 403, 403, 200],
-        ['POST', '/users', { email: 'x@example.com', role: 'admin' }, 403, 403, 200],
         ['DELETE', '/sites/alpha', undefined, 403, 403, 200],
       ];
       for (const [method, target, body, ...statuses] of expectations) {
@@ -205,136 +92,60 @@ test('rôles : chacun ne peut faire que ce que son rôle permet, côté serveur'
   }
 });
 
-test('invitations : usage unique, expiration, mot de passe exigeant', async () => {
-  let current = new Date('2026-11-09T10:00:00Z');
-  await withUi(async ({ admin, createAdmin, client }) => {
-    await createAdmin();
-    const { json } = await admin('POST', '/users', { email: 'bob@example.com', name: 'Bob', role: 'operator' });
-    const token = new URL(json.inviteUrl).searchParams.get('token');
-    assert.equal(json.user.pending, true);
-    assert.equal((await admin('POST', '/users', { email: 'bob@example.com', role: 'viewer' })).status, 400, 'pas de doublon');
-    assert.equal((await admin('POST', '/users', { email: 'pas-une-adresse', role: 'viewer' })).status, 400);
-    assert.equal((await admin('POST', '/users', { email: 'c@example.com', role: 'superadmin' })).status, 400);
-
-    const bob = client();
-    assert.equal((await bob('POST', '/invite/check', { token })).json.user.email, 'bob@example.com');
-    assert.equal((await bob('POST', '/invite/accept', { token, password: 'court' })).status, 400);
-    assert.equal((await bob('POST', '/invite/accept', { token, password: PASSWORD })).status, 200);
-    assert.equal((await bob('GET', '/session')).json.user.role, 'operator');
-    assert.equal((await client()('POST', '/invite/accept', { token, password: PASSWORD })).status, 400, 'lien à usage unique');
-
-    const late = await admin('POST', '/users', { email: 'carol@example.com', role: 'viewer' });
-    const lateToken = new URL(late.json.inviteUrl).searchParams.get('token');
-    current = new Date('2026-11-11T11:00:00Z');
-    assert.equal((await client()('POST', '/invite/accept', { token: lateToken, password: PASSWORD })).status, 400, 'expiré après 48 h');
-  }, { now: () => current });
-});
-
-test('comptes : désactivation et changement de rôle immédiats', () =>
-  withUi(async ({ admin, createAdmin, member }) => {
-    await createAdmin();
-    const bob = await member('operator', 'bob@example.com');
-    assert.equal((await bob('POST', '/sites/x/resume', {})).status, 404, 'rôle suffisant, site inconnu');
-
-    await admin('POST', `/users/${bob.id}`, { role: 'viewer' });
-    assert.equal((await bob('POST', '/sites/x/resume', {})).status, 403, 'le nouveau rôle s’applique sans reconnexion');
-
-    await admin('POST', `/users/${bob.id}`, { disabled: true });
-    assert.equal((await bob('GET', '/sites')).status, 401, 'déconnecté immédiatement');
-    assert.equal((await bob('POST', '/login', { email: 'bob@example.com', password: PASSWORD })).status, 401);
-  }));
-
-test('comptes : il reste toujours un administrateur actif', () =>
-  withUi(async ({ admin, createAdmin }) => {
-    await createAdmin();
-    const { json } = await admin('GET', '/users');
-    const self = json.users[0].id;
-    assert.equal((await admin('POST', `/users/${self}`, { role: 'viewer' })).status, 400);
-    assert.equal((await admin('POST', `/users/${self}`, { disabled: true })).status, 400);
-  }));
-
-test('mot de passe : le changer déconnecte les autres sessions', () =>
-  withUi(async ({ admin, createAdmin, client }) => {
-    await createAdmin();
-    const otherDevice = client();
-    await otherDevice('POST', '/login', { email: 'alice@example.com', password: PASSWORD });
-
-    assert.equal((await admin('POST', '/me/password', { current: 'faux mot de passe', next: 'nouveau mot de passe solide' })).status, 400);
-    assert.equal((await admin('POST', '/me/password', { current: PASSWORD, next: 'nouveau mot de passe solide' })).status, 200);
-    assert.equal((await admin('GET', '/sites')).status, 200, 'la session courante continue');
-    assert.equal((await otherDevice('GET', '/sites')).status, 401);
-    assert.equal((await client()('POST', '/login', { email: 'alice@example.com', password: PASSWORD })).status, 401);
-  }));
-
-test('audit : chaque action garde son auteur, jamais de mot de passe', async () => {
+test('audit : l’agent décrit chaque action à Django, sans secret', async () => {
   const site = await createSandbox();
   try {
-    await withUi(async ({ admin, createAdmin, member, client, registry }) => {
-      await createAdmin();
-      await admin('POST', '/sites', { name: 'alpha', dir: site.siteDir, urls: [site.config.health.urls[0]], commands: { deploy: 'node deploy.cjs' } });
+    await withUi(async ({ as, admin }) => {
+      const added = await admin('POST', '/sites', {
+        name: 'alpha', dir: site.siteDir, urls: [site.config.health.urls[0]], commands: { deploy: 'node deploy.cjs' },
+      });
+      assert.equal(added.headers['x-site-agent-audit'], 'site.add');
+      assert.equal(JSON.parse(decodeURIComponent(added.headers['x-site-agent-audit-details'])).name, 'alpha');
       await admin('POST', '/sites/alpha/mode', { live: true });
-      const bob = await member('operator', 'bob@example.com');
+
+      const bob = as('operator', 'bob');
       site.pushCode('migrations/001.sql', 'A;\n');
       const report = (await bob('POST', '/sites/alpha/run', {})).json;
-      assert.equal((await bob('POST', '/sites/alpha/approve', { id: report.decisions[0].id })).status, 200);
-      await client()('POST', '/login', { email: 'alice@example.com', password: 'tentative ratée ici' });
+      const approval = await bob('POST', '/sites/alpha/approve', { id: report.decisions[0].id });
+      assert.equal(approval.headers['x-site-agent-audit'], 'change.approve');
+      assert.equal(decodeURIComponent(approval.headers['x-site-agent-audit-target']), 'alpha');
+      assert.equal(decodeURIComponent(approval.headers['x-site-agent-audit-outcome']), 'ok');
 
-      const lines = readFileSync(path.join(registry.dataDir(), 'audit.jsonl'), 'utf8');
-      const entries = lines.trim().split('\n').map((line) => JSON.parse(line));
-      const approval = entries.find((entry) => entry.action === 'change.approve');
-      assert.equal(approval.user, 'bob@example.com');
-      assert.equal(approval.target, 'alpha');
-      assert.ok(entries.some((entry) => entry.action === 'login' && entry.user === 'alice@example.com' && entry.outcome.startsWith('refusé')));
-      assert.ok(!lines.includes(PASSWORD) && !lines.includes('tentative ratée'), 'aucun mot de passe dans le journal');
+      const failed = await admin('POST', '/sites/alpha/approve', { id: 'inconnu' });
+      assert.match(decodeURIComponent(failed.headers['x-site-agent-audit-outcome']), /^refusé : /);
 
       const history = (await bob('GET', '/sites/alpha/history')).json.entries;
-      assert.ok(history.some((entry) => entry.message.startsWith('Approuvé par operator')));
+      assert.ok(history.some((entry) => entry.message.startsWith('Approuvé par Nom bob')), 'l’historique garde le nom de la personne');
+      assert.equal((await bob('GET', '/sites')).headers['x-site-agent-audit'], undefined, 'une lecture n’est pas journalisée');
     });
   } finally {
     await site.close();
   }
 });
 
-test('accès : un autre site ne peut pas piloter l’agent', () =>
-  withUi(async ({ origin, admin, createAdmin }) => {
-    await createAdmin();
-    const add = { method: 'POST', path: '/api/sites', body: '{}', headers: { cookie: admin.state.cookie, 'content-type': 'application/json' } };
-    assert.equal((await raw(origin, { ...add, headers: { ...add.headers, origin: 'https://attaquant.example' } })).status, 403);
+test('accès : seul un appel local, sans origine étrangère, est accepté', () =>
+  withUi(async ({ origin, admin }) => {
+    assert.equal((await admin('POST', '/watch', { enabled: false }, { origin: 'https://attaquant.example' })).status, 403);
     // Nom de domaine piégé qui pointe vers 127.0.0.1.
-    assert.equal((await raw(origin, { ...add, headers: { ...add.headers, host: 'attaquant.example' } })).status, 403);
+    assert.equal((await admin('GET', '/sites', undefined, { host: 'attaquant.example' })).status, 403);
+    assert.equal((await admin('GET', '/sites', undefined, { host: '10.10.10.18:8443' })).status, 403, 'seul Django parle à l’agent');
     // Un formulaire HTML ne peut pas envoyer de JSON.
-    assert.equal((await raw(origin, { ...add, headers: { cookie: admin.state.cookie, 'content-type': 'text/plain' } })).status, 415);
+    assert.equal((await admin('POST', '/watch', undefined, { 'content-type': 'text/plain' })).status, 415);
 
     const page = await raw(origin, { path: '/' });
-    assert.equal(page.status, 200, 'la page de connexion est publique, sans aucune donnée');
+    assert.equal(page.status, 200, 'la page ne contient aucune donnée');
     assert.match(page.headers['content-security-policy'], /frame-ancestors 'none'/);
     assert.equal(page.headers['access-control-allow-origin'], undefined);
+    for (const removed of ['/setup', '/invite']) assert.equal((await raw(origin, { path: removed })).status, 404, removed);
+    for (const removed of ['/login', '/users', '/me/password']) {
+      assert.equal((await admin('POST', removed, {})).status, 404, `${removed} : les comptes sont gérés par Django`);
+    }
   }));
-
-test('accès : l’adresse publique configurée est acceptée', () =>
-  withUi(async ({ origin, client, createAdmin }) => {
-    await createAdmin();
-    const response = await raw(origin, { path: '/api/session', headers: { host: 'agent.example.fr' } });
-    assert.equal(response.status, 200);
-    const invite = await client()('POST', '/login', { email: 'x', password: 'y' }, { host: 'autre.example.fr' });
-    assert.equal(invite.status, 403);
-  }, { publicUrl: 'https://agent.example.fr' }));
-
-test('accès : une adresse publique avec un port, derrière IIS par exemple', () =>
-  withUi(async ({ origin, createAdmin }) => {
-    await createAdmin();
-    const withPort = await raw(origin, { path: '/api/session', headers: { host: '10.10.10.18:8443' } });
-    assert.equal(withPort.status, 200);
-    const login = { method: 'POST', path: '/api/login', body: '{}', headers: { host: '10.10.10.18:8443', origin: 'https://10.10.10.18:8443', 'content-type': 'application/json' } };
-    assert.notEqual((await raw(origin, login)).status, 403);
-    assert.equal((await raw(origin, { ...login, headers: { ...login.headers, host: '10.10.10.18', origin: 'https://10.10.10.18' } })).status, 403);
-  }, { publicUrl: 'https://10.10.10.18:8443' }));
 
 test('parcours complet : associer, simuler, passer en réel, valider, retirer', async () => {
   const site = await createSandbox();
   try {
-    await withUi(async ({ admin: call, createAdmin }) => {
-      await createAdmin();
+    await withUi(async ({ admin: call }) => {
       const url = site.config.health.urls[0];
 
       const inspected = await call('POST', '/inspect', { dir: site.siteDir });
@@ -378,20 +189,18 @@ test('parcours complet : associer, simuler, passer en réel, valider, retirer', 
 });
 
 test('surveillance : démarre et s’arrête depuis l’interface', () =>
-  withUi(async ({ admin, createAdmin }) => {
-    await createAdmin();
+  withUi(async ({ admin }) => {
     assert.equal((await admin('POST', '/watch', { enabled: true })).json.watching, true);
     assert.equal((await admin('GET', '/sites')).json.watching, true);
     assert.equal((await admin('POST', '/watch', { enabled: false })).json.watching, false);
   }));
 
 test('démo : ouverte sans compte, mais fermée aux autres sites', () =>
-  withUi(async ({ origin, loginUrl, client }) => {
-    assert.equal(loginUrl, origin);
-    const session = (await client()('GET', '/session')).json;
+  withUi(async ({ origin }) => {
+    const session = JSON.parse((await raw(origin, { path: '/api/session' })).text);
     assert.equal(session.demo, true);
     assert.equal(session.user.role, 'admin');
-    assert.equal((await client()('GET', '/sites')).status, 200);
+    assert.equal((await raw(origin, { path: '/api/sites' })).status, 200);
     const foreign = await raw(origin, {
       method: 'POST',
       path: '/api/sites',
@@ -401,52 +210,20 @@ test('démo : ouverte sans compte, mais fermée aux autres sites', () =>
     assert.equal(foreign.status, 403);
   }, { requireAuth: false }));
 
-test('relance : l’interface déjà ouverte redonne son adresse, un autre programme ne reçoit rien', () =>
-  withUi(async ({ origin, loginUrl, registry }) => {
-    const relaunch = (port) => new Promise((resolve) => {
-      execFile(process.execPath, [CLI, 'ui', '--no-open', '--port', port, '--home', registry.home], { timeout: 20000 }, (error, stdout, stderr) => {
-        resolve({ code: error ? error.code : 0, output: stdout + stderr });
-      });
-    });
-    const other = createServer((_, response) => response.end('autre application'));
-    await new Promise((resolve) => other.listen(0, '127.0.0.1', resolve));
-    try {
-      const again = await relaunch(new URL(origin).port);
-      assert.equal(again.code, 0, again.output);
-      assert.ok(again.output.includes(loginUrl), 'premier lancement : le lien d’installation est redonné');
-
-      const refused = await relaunch(String(other.address().port));
-      assert.equal(refused.code, 1);
-      assert.doesNotMatch(refused.output, /token=/);
-    } finally {
-      other.close();
-    }
+test('relance : l’agent déjà lancé est reconnu, un autre programme non', () =>
+  withUi(async ({ origin }) => {
+    assert.equal(await isUiRunning(new URL(origin).port), true);
+    assert.equal(await isUiRunning(1), false);
   }));
 
-test('ligne de commande : inviter et désactiver un compte en secours', () =>
-  withUi(async ({ registry, createAdmin, client }) => {
-    await createAdmin();
-    const cli = (...args) => new Promise((resolve) => {
-      execFile(process.execPath, [CLI, ...args, '--home', registry.home], (error, stdout, stderr) => resolve({ code: error ? error.code : 0, output: stdout + stderr }));
-    });
-    const added = await cli('user', 'add', 'dan@example.com', '--role', 'viewer', '--name', 'Dan');
-    assert.equal(added.code, 0, added.output);
-    const token = /token=([\w-]+)/.exec(added.output)[1];
-    assert.equal((await client()('POST', '/invite/accept', { token, password: PASSWORD })).status, 200);
-    assert.match((await cli('user', 'list')).output, /dan@example\.com — Dan — Lecteur — actif/);
-    assert.equal((await cli('user', 'disable', 'dan@example.com')).code, 0);
-    assert.equal((await client()('POST', '/login', { email: 'dan@example.com', password: PASSWORD })).status, 401);
-    assert.equal((await cli('user', 'disable', 'alice@example.com')).code, 1, 'dernier administrateur protégé');
-  }));
-
-test('comptes : écritures simultanées sans perte', async () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'site-agent-accounts-'));
+test('clé partagée : créée une fois puis conservée', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'site-agent-key-'));
   try {
-    const accounts = new AccountStore(dir);
-    await Promise.all(Array.from({ length: 10 }, (_, index) => accounts.invite({ email: `p${index}@example.com`, role: 'viewer' })));
-    assert.equal(await accounts.count(), 10);
+    const first = await loadProxySecret(path.join(home, '.site-agent'));
+    assert.match(first, /^[0-9a-f]{64}$/);
+    assert.equal(await loadProxySecret(path.join(home, '.site-agent')), first);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -498,6 +275,17 @@ test('réglages : vider une commande la supprime', () => {
   const view = JSON.parse(JSON.stringify(settingsView(config)));
   view.commands.deploy = '  ';
   assert.equal(settingsPatch(config, view).site.commands.deploy, null);
+});
+
+test('réglages : l’analyse IA s’active depuis l’interface, avec une adresse valide', () => {
+  const config = normalizeConfig(SETTINGS_BASE);
+  const view = settingsView(config);
+  assert.equal(view.advisorEnabled, false);
+  assert.equal(view.advisorModel, 'qwen2.5:7b');
+  const patch = settingsPatch(config, { ...view, advisorEnabled: true, advisorModel: 'llama3.1:8b', advisorOnError: 'approval' });
+  assert.deepEqual(patch.advisor, { enabled: true, model: 'llama3.1:8b', onError: 'approval' });
+  assert.throws(() => settingsPatch(config, { ...view, advisorBaseUrl: 'file:///etc' }), /Adresse d'Ollama invalide/);
+  assert.throws(() => settingsPatch(config, { ...view, advisorModel: ' ' }), /modèle Ollama/);
 });
 
 test('réglages : les valeurs invalides sont refusées', () => {

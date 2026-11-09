@@ -7,6 +7,8 @@ const EMPTY_STATE = {
   blocked: {},
   pending: {},
   approved: [],
+  // Analyses IA, par identifiant de changement.
+  reviews: {},
   paused: null,
   consecutiveFailures: 0,
   healthFailures: 0,

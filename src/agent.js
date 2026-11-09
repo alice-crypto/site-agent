@@ -1,4 +1,5 @@
 import { setTimeout as delay } from 'node:timers/promises';
+import { Advisor, applyReview } from './advisor.js';
 import { runShell } from './exec.js';
 import { Git } from './git.js';
 import { probe } from './health.js';
@@ -38,8 +39,9 @@ function withoutPayload({ payload, ...record }) {
 }
 
 export class Agent {
-  constructor(config, { fetchImpl = fetch, now = () => new Date(), sleep = delay, notifier, silent = false, onReport = null } = {}) {
+  constructor(config, { fetchImpl = fetch, now = () => new Date(), sleep = delay, notifier, silent = false, onReport = null, advisor } = {}) {
     this.config = config;
+    this.advisor = advisor ?? (config.advisor?.enabled ? new Advisor(config.advisor) : null);
     this.onReport = onReport;
     this.fetchImpl = fetchImpl;
     this.now = now;
@@ -192,8 +194,29 @@ export class Agent {
     return changes.sort(comparePriority);
   }
 
+  // Une analyse par version de changement : elle est gardée tant que le changement reste détecté.
+  async #review(changes, state) {
+    if (!this.advisor) return changes;
+    const previous = state.reviews ?? {};
+    state.reviews = {};
+    const reviewed = [];
+    for (const change of changes) {
+      let review = previous[change.id];
+      // Une analyse échouée est retentée au cycle suivant : le modèle était peut-être seulement arrêté.
+      if (!review || review.error) {
+        review = await this.advisor.review(change, { git: this.git });
+        if (review.error && !previous[change.id]?.error) {
+          await this.notifier.send('warn', `Analyse IA impossible pour ${change.title} : ${review.error}`);
+        }
+      }
+      state.reviews[change.id] = review;
+      reviewed.push(applyReview(change, review, this.config.advisor));
+    }
+    return reviewed;
+  }
+
   async #processChanges(state, healthy, report) {
-    const changes = await this.#detectAll();
+    const changes = await this.#review(await this.#detectAll(), state);
     const now = this.now();
     state.autoApplied = state.autoApplied.filter((at) => now.getTime() - Date.parse(at) < DAY_MS);
     const context = {
@@ -209,6 +232,8 @@ export class Agent {
       id: change.id,
       title: change.title,
       risk: change.risk,
+      ruleRisk: change.ruleRisk,
+      advisor: change.advisor,
       outcome,
       reasons,
     }));

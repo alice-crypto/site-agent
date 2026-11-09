@@ -3,7 +3,8 @@ import path from 'node:path';
 
 const DATA_DIR = '.site-agent';
 // Le verrou et le lien d'installation n'ont aucun sens une fois restaurés.
-const SKIPPED = new Set(['lock', 'ui-token']);
+// Les clés se recréent au démarrage ; les comptes et le journal sont dans PostgreSQL, sauvegardé à part.
+const SKIPPED = new Set(['lock', 'proxy-secret', 'django-secret-key']);
 
 async function exists(file) {
   return stat(file).then(() => true, () => false);

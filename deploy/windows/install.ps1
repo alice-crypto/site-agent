@@ -44,6 +44,8 @@ param(
   [string] $ServiceUser = 'site-agent',
   [string] $CaddyPath = 'C:\caddy\caddy.exe',
   [int] $Port = 4310,
+  # Port local de l'administration Django, que Caddy publie en HTTPS.
+  [int] $WebPort = 8000,
   # Nom interne (ex. agent.intranet) qui n'est pas joignable depuis Internet : certificats internes.
   [switch] $Internal,
   # Qui peut joindre l'agent. Par défaut : le réseau local en interne, tout le monde sinon.
@@ -98,7 +100,7 @@ if ($IsIpAddress) {
 # Un certificat public n'est délivré que pour un nom joignable depuis Internet : sinon, Caddy signe lui-même.
 $UseInternalTls = $IsIpAddress -or $Internal -or ($Domain -notmatch '\.')
 if (-not $AllowFrom) { $AllowFrom = if ($UseInternalTls) { @('LocalSubnet') } else { @('Any') } }
-if ($HttpsPort -eq $Port) { throw "Le port HTTPS ne peut pas être celui de l'agent ($Port)." }
+if ($HttpsPort -in $Port, $WebPort) { throw "Le port HTTPS ne peut pas être celui de l'agent ($Port) ni de l'administration ($WebPort)." }
 # Let's Encrypt vérifie le domaine sur les ports 80 ou 443 : un autre port n'est possible qu'avec un certificat interne.
 if ($HttpsPort -ne 443 -and -not $UseInternalTls) {
   throw "-HttpsPort n'est possible qu'en réseau local (adresse IP ou -Internal) : un certificat public exige les ports 80 et 443."
@@ -121,7 +123,31 @@ if ($NodeVersion.Major -lt 20) { throw "Node.js $NodeVersion est trop ancien : i
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git est introuvable. Installez Git for Windows depuis https://git-scm.com puis relancez ce script.' }
 if (-not (Test-Path $CaddyPath)) { throw "Caddy est introuvable à $CaddyPath. Téléchargez caddy.exe (Windows amd64) depuis https://caddyserver.com/download et placez-le à cet endroit." }
 if (-not (Test-Path (Join-Path $InstallDir 'src\cli.js'))) { throw "Site Agent est introuvable dans $InstallDir." }
-Write-Host "Node.js $NodeVersion, Git et Caddy trouvés. Dossier : $InstallDir"
+$Python = (Get-Command python -ErrorAction SilentlyContinue).Source
+if (-not $Python) { throw 'Python est introuvable. Installez Python 3.11 ou plus récent depuis https://www.python.org (cochez « Add python.exe to PATH ») puis relancez ce script.' }
+$EnvFile = Join-Path $InstallDir 'webadmin\.env'
+if (-not (Test-Path $EnvFile)) {
+  throw "Configuration de l'administration introuvable : copiez webadmin\.env.example en webadmin\.env et indiquez-y la base PostgreSQL (DATABASE_URL)."
+}
+Write-Host "Node.js $NodeVersion, Python, Git et Caddy trouvés. Dossier : $InstallDir"
+
+Write-Step 'Dépendances de l''agent et de l''administration'
+Push-Location $InstallDir
+try {
+  & npm ci --omit=dev --no-audit --no-fund
+  if ($LASTEXITCODE -ne 0) { throw 'npm ci a échoué.' }
+  $VenvPython = Join-Path $InstallDir 'webadmin\.venv\Scripts\python.exe'
+  if (-not (Test-Path $VenvPython)) { & $Python -m venv (Join-Path $InstallDir 'webadmin\.venv') }
+  & $VenvPython -m pip install --quiet --disable-pip-version-check -r (Join-Path $InstallDir 'webadminequirements\production.txt')
+  if ($LASTEXITCODE -ne 0) { throw 'Installation des paquets Python impossible.' }
+  # Vérifie la connexion à PostgreSQL et crée les tables avant de démarrer le service.
+  Push-Location (Join-Path $InstallDir 'webadmin')
+  try {
+    $env:DJANGO_SETTINGS_MODULE = 'config.settings.production'
+    & $VenvPython manage.py migrate --noinput
+    if ($LASTEXITCODE -ne 0) { throw 'Base PostgreSQL inaccessible : vérifiez DATABASE_URL dans webadmin\.env.' }
+  } finally { Pop-Location }
+} finally { Pop-Location }
 
 Write-Step "Compte Windows dédié « $ServiceUser »"
 # Un contrôleur de domaine n'a pas de comptes locaux : l'agent doit être installé sur un serveur membre.
@@ -160,7 +186,7 @@ Write-Host 'Droits accordés.'
 Write-Step 'Adresse publique'
 $DefaultsPath = Join-Path $InstallDir 'agent.defaults.json'
 $Defaults = Get-Content -Raw -Encoding UTF8 $DefaultsPath | ConvertFrom-Json
-$Ui = [pscustomobject]@{ port = $Port; publicUrl = $PublicUrl }
+$Ui = [pscustomobject]@{ port = $Port; webPort = $WebPort; publicUrl = $PublicUrl }
 if ($Defaults.PSObject.Properties.Name -contains 'ui') { $Defaults.ui = $Ui } else { $Defaults | Add-Member -NotePropertyName ui -NotePropertyValue $Ui }
 [System.IO.File]::WriteAllText($DefaultsPath, ($Defaults | ConvertTo-Json -Depth 20), [System.Text.UTF8Encoding]::new($false))
 Write-Host "Site Agent répondra sur $PublicUrl"
@@ -185,7 +211,7 @@ if ($UseInternalTls) {
 $GlobalOptions$PublicUrl {
 	tls internal
 	encode gzip
-	reverse_proxy 127.0.0.1:$Port
+	reverse_proxy 127.0.0.1:$WebPort
 }
 "@
 } else {
@@ -193,7 +219,7 @@ $GlobalOptions$PublicUrl {
 # Créé par Site Agent. Caddy obtient et renouvelle le certificat HTTPS tout seul.
 $Domain {
 	encode gzip
-	reverse_proxy 127.0.0.1:$Port
+	reverse_proxy 127.0.0.1:$WebPort
 }
 "@
 }
@@ -222,17 +248,18 @@ foreach ($FirewallPort in $WebPorts) {
   }
 }
 Write-Host "Ouverts depuis : $($AllowFrom -join ', ')"
-Write-Host "Le port $Port de l'agent reste fermé à l'extérieur : seul Caddy y accède."
+Write-Host "Les ports $Port (agent) et $WebPort (administration) restent fermés à l'extérieur : seul Caddy y accède."
 
 Write-Step 'Démarrage'
 Stop-ScheduledTask -TaskName $AgentTask -ErrorAction SilentlyContinue
 Start-ScheduledTask -TaskName $AgentTask
 Start-ScheduledTask -TaskName $CaddyTask
 $Ready = $false
-foreach ($Attempt in 1..20) {
+foreach ($Attempt in 1..60) {
   Start-Sleep -Seconds 1
   try {
-    $Session = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/session" -TimeoutSec 2
+    # L'administration répond quand l'agent l'a démarrée : les deux tournent alors.
+    $Session = Invoke-RestMethod -Uri "http://127.0.0.1:$WebPort/api/session" -TimeoutSec 2
     if ($Session.service -eq 'site-agent') { $Ready = $true; break }
   } catch { }
 }
@@ -258,15 +285,21 @@ if ($UseInternalTls) {
 }
 
 Write-Step 'Premier administrateur'
-Push-Location $InstallDir
-try { & $Node src\cli.js setup-link } finally { Pop-Location }
+$Admins = & $VenvPython (Join-Path $InstallDir 'webadmin\manage.py') shell -c "from site_agent.users.models import User; print(User.objects.filter(is_superuser=True).count())"
+if ([int]($Admins | Select-Object -Last 1) -eq 0) {
+  Write-Host 'Créez maintenant votre compte administrateur :'
+  Push-Location (Join-Path $InstallDir 'webadmin')
+  try { & $VenvPython manage.py createsuperuser } finally { Pop-Location }
+} else {
+  Write-Host 'Un administrateur existe déjà. Les comptes se gèrent dans l''administration, à /admin/.'
+}
 
 Write-Host ''
 Write-Host 'Installation terminée.' -ForegroundColor Green
 if ($UseInternalTls) {
-  Write-Host 'Installez d''abord le certificat racine sur votre PC, puis ouvrez le lien ci-dessus.'
+  Write-Host "Installez d'abord le certificat racine sur votre PC, puis ouvrez $PublicUrl."
 } else {
-  Write-Host "Ouvrez le lien ci-dessus depuis votre PC. Si le certificat n'est pas encore prêt, attendez une minute :"
+  Write-Host "Ouvrez $PublicUrl depuis votre PC. Si le certificat n'est pas encore prêt, attendez une minute :"
   Write-Host "Caddy l'obtient dès que le nom $Domain pointe vers ce serveur."
 }
 Write-Host 'Étape suivante : créer la clé de déploiement du compte de service (voir le guide, partie 7).'

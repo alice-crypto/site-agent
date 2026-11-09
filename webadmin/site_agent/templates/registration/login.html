@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Connexion · Site Agent{% endblock %}
+{% block content %}
+  <h1>Connexion</h1>
+  <form method="post" novalidate>
+    {% csrf_token %}
+    {% include "_fields.html" %}
+    <input type="hidden" name="next" value="{{ next|default:'/' }}">
+    <button class="button primary" type="submit">Se connecter</button>
+  </form>
+  <p class="muted"><a href="{% url 'password_reset' %}">Mot de passe oublié ?</a></p>
+{% endblock %}

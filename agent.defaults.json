@@ -69,6 +69,7 @@
   },
   "ui": {
     "port": 4310,
+    "webPort": 8000,
     "publicUrl": null
   },
   "notify": {

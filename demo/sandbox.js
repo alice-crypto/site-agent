@@ -57,7 +57,7 @@ function startSite(siteDir) {
 }
 
 // Crée un vrai site local : dépôt Git, dépôt distant, serveur HTTP et source de contenu.
-export async function createSandbox({ overrides = {}, now, silent = true } = {}) {
+export async function createSandbox({ overrides = {}, now, silent = true, agentOptions = {} } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'site-agent-'));
   const remote = path.join(root, 'remote.git');
   const siteDir = path.join(root, 'site');
@@ -119,6 +119,7 @@ export async function createSandbox({ overrides = {}, now, silent = true } = {})
   const agent = new Agent(config, {
     now,
     notifier: new Notifier({ store, silent, now }),
+    ...agentOptions,
   });
 
   return {

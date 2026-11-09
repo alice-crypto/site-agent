@@ -21,6 +21,8 @@ export function decide(change, { policy, state, healthy, schedule, autoCountToda
   const approved = state.approved.includes(change.id);
 
   if (action === 'deny') return { outcome: 'denied', reasons: [`interdit par : ${ruleName}`], rule };
+  // L'analyse IA peut exiger une validation humaine, jamais en dispenser.
+  if (change.requiresReview && !approved) return { outcome: 'awaiting-approval', reasons: [change.requiresReview], rule };
   if (action === 'approval' && !approved) {
     return { outcome: 'awaiting-approval', reasons: [`validation requise par : ${ruleName}`], rule };
   }

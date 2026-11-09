@@ -51,6 +51,15 @@ export class Git {
     });
   }
 
+  // Pour l'analyse IA : messages des commits et diff, sans couleur ni pagination.
+  log(from, to) {
+    return this.#output(['log', '--no-color', '--format=%h %an : %s', `${from}..${to}`]);
+  }
+
+  diff(from, to) {
+    return this.#output(['diff', '--no-color', '--no-ext-diff', '--stat', '--patch', from, to]);
+  }
+
   async changedFiles(from, to) {
     const output = await this.#output(['diff', '--name-only', from, to]);
     return output ? output.split('\n') : [];

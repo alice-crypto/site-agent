@@ -1,0 +1,5 @@
+{% extends "base.html" %}
+{% block content %}
+  <h1>Pas encore d'accès</h1>
+  <p class="muted">Votre compte {{ user.get_username }} existe, mais n'appartient à aucun groupe de l'agent. Demandez à un administrateur de vous ajouter au groupe Lecteurs, Opérateurs ou Administrateurs.</p>
+{% endblock %}

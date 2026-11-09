@@ -1,29 +1,23 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
-import { AccountStore, ROLE_LABELS } from './accounts.js';
 import { Agent } from './agent.js';
 import { runDaemon } from './daemon.js';
 import { Registry } from './registry.js';
 import { associateSite, COMMAND_NAMES, DEDICATED_COPY_WARNING } from './site-setup.js';
 import { createBackup } from './backup.js';
-import { createUiServer, isUiRunning, loadSetupToken, openInBrowser } from './ui/server.js';
+import { createUiServer, isUiRunning, openInBrowser } from './ui/server.js';
+import { startWebAdmin } from './webadmin.js';
 
 const USAGE = `Utilisation : node src/cli.js <commande>
 
-Interface graphique :
-  ui [--port n] [--no-open]   Ouvre le tableau de bord dans le navigateur
+Interface graphique (avec l'administration Django, qui gère les comptes) :
+  ui [--no-open]              Ouvre le tableau de bord dans le navigateur
 
 Sur un serveur :
   serve                       Interface et surveillance permanentes, sauvegarde quotidienne
-  setup-link                  Affiche le lien de création du premier administrateur
-  backup                      Sauvegarde la configuration, les comptes et l'historique
+  backup                      Sauvegarde la configuration et l'historique des sites
 
-Comptes de l'équipe (les invitations se font aussi depuis l'interface) :
-  user list                                   Liste les comptes
-  user add <email> --role r [--name nom]      Invite une personne (r : viewer, operator, admin)
-  user invite <email>                         Nouveau lien, par exemple pour un mot de passe oublié
-  user role <email> --role r                  Change le rôle
-  user disable <email> / user enable <email>  Désactive ou réactive un compte
+Les comptes, les groupes et le journal d'audit se gèrent dans l'administration Django, à l'adresse /admin/.
 
 Associer des sites :
   add <site> --dir <dossier> --url <adresse>   Associe un site (toujours en simulation au départ)
@@ -81,34 +75,41 @@ async function add(registry, name, values) {
   for (const warning of result.warnings) console.log(`Attention : ${warning}`);
 }
 
+// L'agent et l'administration Django démarrent ensemble : Django sert l'interface et gère les comptes.
+async function startAll(registry) {
+  const settings = await registry.uiSettings();
+  const server = await createUiServer(registry, { port: settings.port });
+  const { origin } = await server.listen();
+  const agentPort = Number(new URL(origin).port);
+  const web = startWebAdmin({ home: registry.home, agentPort, webPort: settings.webPort, publicUrl: settings.publicUrl });
+  const stop = async () => {
+    await web.stop();
+    await server.close();
+  };
+  return { origin, web, stop };
+}
+
 async function ui(registry, values) {
   const settings = await registry.uiSettings();
-  const port = values.port === undefined ? settings.port : Number(values.port);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error(`Port invalide : ${values.port}`);
-
-  const server = await createUiServer(registry, { port, publicUrl: settings.publicUrl });
-  const showLink = (url) => {
-    if (url.includes('/setup?')) {
-      console.log("Première utilisation : ouvrez ce lien pour créer le compte administrateur. Il ne sert qu'une fois, ne le partagez pas :");
-    } else {
-      console.log('Interface disponible à cette adresse :');
-    }
-    console.log(url);
-    if (!values['no-open']) openInBrowser(url);
-  };
-
+  let started;
   try {
-    showLink((await server.listen()).loginUrl);
+    started = await startAll(registry);
   } catch (error) {
     if (error.code !== 'EADDRINUSE') throw error;
-    if (!(await isUiRunning(port))) throw new Error(`Le port ${port} est utilisé par une autre application. Essayez --port.`);
+    if (!(await isUiRunning(settings.port))) throw new Error(`Le port ${settings.port} est utilisé par une autre application.`);
     // Déjà lancée : on rouvre simplement l'adresse, sans démarrer une seconde interface.
-    showLink(server.urlsOn(port).loginUrl);
+    const url = settings.publicUrl ?? `http://127.0.0.1:${settings.webPort}`;
+    console.log(`Site Agent tourne déjà : ${url}`);
+    if (!values['no-open']) openInBrowser(url);
     return;
   }
+  await started.web.ready;
+  console.log(`Site Agent : ${started.web.url}`);
+  console.log('Premier lancement ? Créez le compte administrateur : webadmin/.venv/Scripts/python webadmin/manage.py createsuperuser');
+  if (!values['no-open']) openInBrowser(started.web.url);
 
   const stop = async () => {
-    await server.close();
+    await started.stop();
     process.exit(0);
   };
   process.once('SIGINT', stop);
@@ -157,13 +158,9 @@ async function run(registry, name, values) {
 const BACKUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 // Mode serveur : lancé par le service Windows, sans navigateur, avec une sauvegarde par jour.
-async function serve(registry, values) {
-  const settings = await registry.uiSettings();
-  const port = values.port === undefined ? settings.port : Number(values.port);
-  const server = await createUiServer(registry, { port, publicUrl: settings.publicUrl });
-  const { origin, loginUrl } = await server.listen();
-  console.log(`${new Date().toISOString()} Site Agent démarré sur ${origin}${settings.publicUrl ? `, publié sur ${settings.publicUrl}` : ''}.`);
-  if (loginUrl.includes('/setup?')) console.log("Aucun compte : obtenez le lien d'installation avec « node src/cli.js setup-link ».");
+async function serve(registry) {
+  const { origin, web, stop: stopAll } = await startAll(registry);
+  console.log(`${new Date().toISOString()} Site Agent démarré sur ${origin}, administration sur ${web.url}.`);
 
   const backup = async () => {
     try {
@@ -177,67 +174,11 @@ async function serve(registry, values) {
 
   const stop = async () => {
     clearInterval(timer);
-    await server.close();
+    await stopAll();
     process.exit(0);
   };
   process.once('SIGINT', stop);
   process.once('SIGTERM', stop);
-}
-
-async function setupLink(registry) {
-  if (await new AccountStore(registry.dataDir()).count()) {
-    console.log('Un administrateur existe déjà. Pour un nouvel accès : node src/cli.js user invite <email>');
-    return;
-  }
-  const settings = await registry.uiSettings();
-  const base = settings.publicUrl ?? `http://127.0.0.1:${settings.port}`;
-  console.log("Lien d'installation (à usage unique, ne le partagez pas) :");
-  console.log(`${base}/setup?token=${await loadSetupToken(registry.dataDir())}`);
-}
-
-// Gestion des comptes en ligne de commande : utile sur le serveur si plus aucun administrateur ne peut se connecter.
-async function users(registry, action, email, values) {
-  const accounts = new AccountStore(registry.dataDir());
-  const settings = await registry.uiSettings();
-  const base = settings.publicUrl ?? `http://127.0.0.1:${settings.port}`;
-  const find = async () => {
-    const user = await accounts.findByEmail(requireArgument(email, 'Adresse e-mail'));
-    if (!user) throw new Error(`Aucun compte pour ${email}.`);
-    return user;
-  };
-  const printInvite = (token) => {
-    console.log("Lien à transmettre à la personne (valable 48 h, à usage unique, ne le publiez pas) :");
-    console.log(`${base}/invite?token=${token}`);
-  };
-
-  switch (action) {
-    case 'list':
-      for (const user of await accounts.list()) {
-        const status = user.disabled ? 'désactivé' : user.pending ? 'invitation en attente' : 'actif';
-        console.log(`${user.email} — ${user.name} — ${ROLE_LABELS[user.role]} — ${status}`);
-      }
-      break;
-    case 'add': {
-      const { token } = await accounts.invite({ email, name: values.name, role: values.role ?? 'viewer' });
-      printInvite(token);
-      break;
-    }
-    case 'invite':
-      printInvite((await accounts.reinvite((await find()).id)).token);
-      break;
-    case 'disable':
-    case 'enable':
-      await accounts.update((await find()).id, { disabled: action === 'disable' });
-      console.log(`Compte ${email} ${action === 'disable' ? 'désactivé' : 'réactivé'}. Si l'interface tourne, la modification est immédiate.`);
-      break;
-    case 'role':
-      await accounts.update((await find()).id, { role: requireArgument(values.role, 'Option --role') });
-      console.log(`Rôle de ${email} : ${ROLE_LABELS[values.role]}.`);
-      break;
-    default:
-      console.log(USAGE);
-      process.exitCode = 1;
-  }
 }
 
 async function printSiteStatus(registry, name) {
@@ -293,9 +234,6 @@ async function main() {
       all: { type: 'boolean', default: false },
       live: { type: 'boolean', default: false },
       'dry-run': { type: 'boolean', default: false },
-      port: { type: 'string' },
-      name: { type: 'string' },
-      role: { type: 'string' },
       'no-open': { type: 'boolean', default: false },
     },
   });
@@ -307,14 +245,8 @@ async function main() {
     case 'ui':
       await ui(registry, values);
       break;
-    case 'user':
-      await users(registry, name, argument, values);
-      break;
     case 'serve':
-      await serve(registry, values);
-      break;
-    case 'setup-link':
-      await setupLink(registry);
+      await serve(registry);
       break;
     case 'backup':
       console.log(`Sauvegarde créée : ${await createBackup(registry.home)}`);

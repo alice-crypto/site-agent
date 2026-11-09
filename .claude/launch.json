@@ -6,6 +6,12 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["demo/ui-demo.js", "--no-open"],
       "port": 4310
+    },
+    {
+      "name": "site-agent",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["src/cli.js", "ui", "--no-open"],
+      "port": 8000
     }
   ]
 }

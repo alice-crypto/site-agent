@@ -27,16 +27,12 @@ const COMMANDS = [['deploy', 'Déploiement'], ['test', 'Tests'], ['install', 'In
 
 const ROLE_LABELS = { viewer: 'Lecteur', operator: 'Opérateur', admin: 'Administrateur' };
 const ROLE_RANK = { viewer: 0, operator: 1, admin: 2 };
-const ROLE_HINTS = {
-  viewer: 'Consulte les sites, leur état et leur historique.',
-  operator: 'Peut aussi simuler, lancer un cycle et valider les mises à jour.',
-  admin: 'Peut tout faire, dont gérer les sites, les règles et l’équipe.',
-};
+const LOGIN_URL = '/comptes/connexion/';
 
 const app = {
   user: null,
   demo: false,
-  view: 'sites',
+  links: {},
   sites: [],
   watching: false,
   selected: null,
@@ -67,18 +63,29 @@ function h(tag, props = {}, ...children) {
   return element;
 }
 
+// Django refuse toute modification qui ne renvoie pas son jeton anti-falsification (CSRF).
+function csrfToken() {
+  const cookie = document.cookie.split('; ').find((part) => part.startsWith('site_agent_csrf='));
+  return cookie ? decodeURIComponent(cookie.slice('site_agent_csrf='.length)) : '';
+}
+
+function goToLogin() {
+  location.assign(`${app.links.login ?? LOGIN_URL}?next=${encodeURIComponent(location.pathname)}`);
+}
+
 async function api(path, { method = 'GET', body } = {}) {
+  const headers = body === undefined ? {} : { 'content-type': 'application/json' };
+  if (method !== 'GET') headers['x-csrftoken'] = csrfToken();
   const response = await fetch(`/api${path}`, {
     method,
-    headers: body === undefined ? {} : { 'content-type': 'application/json' },
+    headers,
+    credentials: 'same-origin',
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const payload = await response.json().catch(() => ({}));
-  if (response.status === 401 && app.user) {
-    app.user = null;
-    showAuth('login', { notice: 'Votre session a expiré. Reconnectez-vous.' });
-  }
-  if (!response.ok) throw new Error(payload.error ?? `Erreur ${response.status}`);
+  // Session expirée : la connexion se fait sur la page de Django.
+  if (response.status === 401 && !app.demo) goToLogin();
+  if (!response.ok) throw new Error(payload.error ?? payload.detail ?? `Erreur ${response.status}`);
   return payload;
 }
 
@@ -157,7 +164,6 @@ function renderSidebar() {
   // Reconstruire une liste inchangée ferait perdre le focus clavier et les clics en cours.
   const signature = JSON.stringify([
     app.loaded,
-    app.view,
     app.selected,
     app.sites.map((site) => [site.name, healthInfo(site).label, site.live, site.pending?.length]),
   ]);
@@ -171,11 +177,8 @@ function renderSidebar() {
       h('button', {
         class: 'site-link',
         type: 'button',
-        'aria-current': app.view === 'sites' && site.name === app.selected ? 'true' : 'false',
-        onclick: () => {
-          app.view = 'sites';
-          select(site.name);
-        },
+        'aria-current': site.name === app.selected ? 'true' : 'false',
+        onclick: () => select(site.name),
       },
         h('span', { class: `dot ${info.dot}`, title: info.label }),
         h('span', { class: 'site-link-text' },
@@ -306,12 +309,29 @@ function metricsBlock(site) {
   );
 }
 
+const RECOMMENDATIONS = { apply: ['Feu vert', 'good'], review: ['À regarder', 'warn'], reject: ['Déconseillé', 'bad'] };
+
+// Avis du modèle de langage sur un changement : résumé, points à vérifier, et risque relevé s'il y a lieu.
+function advisorNote(item) {
+  const review = item.advisor;
+  if (!review) return null;
+  if (review.error) return h('div', { class: 'advisor muted' }, `Analyse IA indisponible : ${review.error}`);
+  const [label, tone] = RECOMMENDATIONS[review.recommendation] ?? [review.recommendation, ''];
+  const raised = item.ruleRisk && item.ruleRisk !== item.risk ? ` · risque relevé de ${RISKS[item.ruleRisk] ?? item.ruleRisk} à ${RISKS[item.risk] ?? item.risk}` : '';
+  return h('div', { class: 'advisor' },
+    h('div', { class: 'advisor-head' }, h('span', { class: `badge ${tone}` }, `IA : ${label}`), h('span', { class: 'muted' }, `${review.model}${raised}`)),
+    h('p', {}, review.summary),
+    review.concerns?.length ? h('ul', {}, review.concerns.map((concern) => h('li', {}, concern))) : null,
+  );
+}
+
 function pendingBlock(site) {
   const cards = site.pending.map((change) =>
     h('div', { class: 'change' },
       h('div', { class: 'change-main' },
         h('div', { class: 'change-title' }, change.title),
         h('div', { class: 'change-meta' }, `Risque ${RISKS[change.risk] ?? change.risk}${change.sensitive?.length ? ` · fichiers sensibles : ${change.sensitive.join(', ')}` : ''}`),
+        advisorNote(change),
       ),
       change.approved
         ? h('span', { class: 'badge good' }, 'Approuvé')
@@ -357,6 +377,7 @@ function decisionsBlock(site) {
           h('div', { class: 'change-main' },
             h('div', { class: 'change-title' }, decision.title),
             h('div', { class: 'change-meta' }, `Risque ${RISKS[decision.risk] ?? decision.risk} · ${decision.reasons.join(' ; ')}`),
+            advisorNote(decision),
           ),
           h('span', { class: `badge ${executed && last.report.applied.result !== 'deployed' ? 'bad' : tone}` }, shown),
         );
@@ -564,6 +585,22 @@ function trackingPanel(draft) {
   );
 }
 
+function advisorPanel(draft) {
+  const onError = h('select', { onchange: (event) => { draft.advisorOnError = event.target.value; } },
+    [['rules', 'Décider avec les règles seules'], ['approval', 'Demander une validation humaine']].map(([value, label]) =>
+      h('option', { value, selected: draft.advisorOnError === value }, label)));
+  return h('div', { class: 'panel' },
+    h('h3', {}, 'Analyse IA'),
+    h('p', { class: 'panel-note' }, 'Un modèle de langage local (Ollama) lit chaque mise à jour et donne son avis. Il peut seulement relever le risque ou demander une validation : il n’autorise jamais ce que les règles retiennent.'),
+    checkbox('Analyser chaque mise à jour', draft, 'advisorEnabled'),
+    h('div', { class: 'field-grid' },
+      field('Modèle Ollama', textInput(draft, 'advisorModel', { class: 'mono' }), 'Exemple : qwen2.5:7b'),
+      field('Adresse d’Ollama', textInput(draft, 'advisorBaseUrl', { class: 'mono' })),
+      field('Si le modèle ne répond pas', onError),
+    ),
+  );
+}
+
 function commandsPanel(draft) {
   return h('div', { class: 'panel' },
     h('h3', {}, 'Commandes'),
@@ -610,7 +647,7 @@ async function renderSettings(site, container) {
     }
   });
 
-  const panels = [matrixPanel(draft), schedulePanel(draft), limitsPanel(draft), trackingPanel(draft), commandsPanel(draft)];
+  const panels = [matrixPanel(draft), schedulePanel(draft), limitsPanel(draft), trackingPanel(draft), advisorPanel(draft), commandsPanel(draft)];
   if (!can('admin')) {
     for (const control of panels.flatMap((panel) => [...panel.querySelectorAll('input, select, textarea, button')])) control.disabled = true;
     container.replaceChildren(h('p', { class: 'banner warn readonly-note' }, 'Lecture seule : seul un administrateur peut modifier les règles.'), ...panels);
@@ -658,10 +695,6 @@ function render() {
   renderSidebar();
 
   if (!app.loaded) return;
-  if (app.view === 'team') {
-    if ($('detail').dataset.key !== 'team') renderTeam();
-    return;
-  }
   if (!app.sites.length) {
     renderWelcome();
     return;
@@ -803,327 +836,54 @@ async function toggleWatch() {
   }
 }
 
-/* Équipe */
-function inviteResult(url, label) {
-  const input = h('input', { value: url, readOnly: true, 'aria-label': 'Lien d’invitation', onfocus: (event) => event.target.select() });
-  return h('div', { class: 'invite-result', role: 'status' },
-    h('strong', {}, label),
-    h('div', { class: 'invite-link' },
-      input,
-      h('button', {
-        class: 'button small',
-        type: 'button',
-        onclick: async () => {
-          try {
-            await navigator.clipboard.writeText(url);
-            toast('Lien copié.', 'good');
-          } catch {
-            input.select();
-            toast('Copie impossible : sélectionnez le lien et copiez-le avec Ctrl+C.');
-          }
-        },
-      }, 'Copier'),
-    ),
-    h('small', {}, 'Envoyez-le à la personne par un canal privé. Valable 48 h, à usage unique, et il ne sera plus affiché.'),
-  );
-}
-
-function roleSelect(value, onchange, props = {}) {
-  return h('select', { onchange, ...props },
-    Object.entries(ROLE_LABELS).map(([role, label]) => h('option', { value: role, selected: role === value }, label)));
-}
-
-function userStatus(user) {
-  if (user.disabled) return ['Désactivé', 'bad'];
-  if (user.pending) {
-    return Date.parse(user.inviteExpiresAt) < Date.now() ? ['Invitation expirée', 'bad'] : ['Invitation en attente', 'warn'];
-  }
-  return ['Actif', 'good'];
-}
-
-async function renderTeam() {
-  $('detail').dataset.key = 'team';
-  const resultSlot = h('div', {});
-  const list = h('div', {}, h('div', { class: 'empty' }, 'Chargement…'));
-
-  const invite = { email: '', name: '', role: 'operator' };
-  const hint = h('p', { class: 'panel-note' }, ROLE_HINTS[invite.role]);
-  const inviteForm = h('div', { class: 'panel' },
-    h('h3', {}, 'Inviter une personne'),
-    h('p', { class: 'panel-note' }, 'Vous obtenez un lien à lui transmettre ; elle y choisit son propre mot de passe.'),
-    h('div', { class: 'field-grid' },
-      field('E-mail', textInput(invite, 'email', { type: 'email' })),
-      field('Nom', textInput(invite, 'name')),
-      field('Rôle', roleSelect(invite.role, (event) => { invite.role = event.target.value; hint.textContent = ROLE_HINTS[invite.role]; })),
-    ),
-    hint,
-    h('button', {
-      class: 'button primary',
-      type: 'button',
-      onclick: async (event) => {
-        event.target.disabled = true;
-        try {
-          const { inviteUrl, user } = await api('/users', { method: 'POST', body: invite });
-          resultSlot.replaceChildren(inviteResult(inviteUrl, `Invitation créée pour ${user.email}`));
-          invite.email = '';
-          invite.name = '';
-          inviteForm.querySelectorAll('input').forEach((input) => { input.value = ''; });
-          await drawList();
-        } catch (error) {
-          toast(error.message, 'bad');
-        } finally {
-          event.target.disabled = false;
-        }
-      },
-    }, 'Créer l’invitation'),
-    resultSlot,
-  );
-
-  async function change(user, patch, message) {
-    try {
-      await api(`/users/${encodeURIComponent(user.id)}`, { method: 'POST', body: patch });
-      toast(message, 'good');
-    } catch (error) {
-      toast(error.message, 'bad');
-    }
-    await drawList();
-  }
-
-  async function drawList() {
-    let users;
-    try {
-      ({ users } = await api('/users'));
-    } catch (error) {
-      list.replaceChildren(h('p', { class: 'form-error' }, error.message));
-      return;
-    }
-    list.replaceChildren(h('table', { class: 'team-table' },
-      h('thead', {}, h('tr', {}, h('th', {}, 'Personne'), h('th', {}, 'Rôle'), h('th', {}, 'État'), h('th', {}, h('span', { class: 'muted' }, 'Actions')))),
-      h('tbody', {}, users.map((user) => {
-        const [status, tone] = userStatus(user);
-        const self = user.id === app.user.id;
-        return h('tr', {},
-          h('td', { class: 'team-who' },
-            h('div', {}, user.name, self ? h('span', { class: 'muted' }, ' (vous)') : null),
-            h('div', { class: 'team-email' }, user.email)),
-          h('td', {}, roleSelect(user.role, (event) => change(user, { role: event.target.value }, 'Rôle modifié.'), {
-            disabled: self,
-            'aria-label': `Rôle de ${user.name}`,
-            title: self ? 'Vous ne pouvez pas changer votre propre rôle.' : '',
-          })),
-          h('td', {}, h('span', { class: `badge ${tone}` }, status)),
-          h('td', {},
-            h('button', {
-              class: 'button small',
-              type: 'button',
-              disabled: user.disabled,
-              onclick: async () => {
-                try {
-                  const { inviteUrl } = await api(`/users/${encodeURIComponent(user.id)}/invite`, { method: 'POST', body: {} });
-                  resultSlot.replaceChildren(inviteResult(inviteUrl, `Nouveau lien pour ${user.email}${user.pending ? '' : ' (changement de mot de passe)'}`));
-                  resultSlot.scrollIntoView({ block: 'nearest' });
-                  await drawList();
-                } catch (error) {
-                  toast(error.message, 'bad');
-                }
-              },
-            }, 'Nouveau lien'),
-            ' ',
-            self ? null : h('button', {
-              class: `button small ${user.disabled ? '' : 'danger'}`,
-              type: 'button',
-              onclick: async () => {
-                if (!user.disabled) {
-                  const accepted = await confirmAction({
-                    title: `Désactiver ${user.name} ?`,
-                    text: 'La personne est déconnectée immédiatement et ne peut plus se connecter. Vous pourrez réactiver le compte.',
-                    ok: 'Désactiver',
-                    danger: true,
-                  });
-                  if (!accepted) return;
-                }
-                await change(user, { disabled: !user.disabled }, user.disabled ? 'Compte réactivé.' : 'Compte désactivé.');
-              },
-            }, user.disabled ? 'Réactiver' : 'Désactiver'),
-          ),
-        );
-      })),
-    ));
-  }
-
-  $('detail').replaceChildren(h('div', { class: 'detail-inner' },
-    h('div', { class: 'site-header' }, h('div', {}, h('h1', {}, 'Équipe'), h('p', { class: 'site-sub' }, 'Qui peut accéder à l’agent, et avec quels droits.'))),
-    inviteForm,
-    h('div', { class: 'panel' }, h('h3', {}, 'Membres'), list),
-  ));
-  await drawList();
-}
-
-/* Connexion, invitation, installation */
-function authCard(title, intro, fields, submitLabel, onSubmit, extra = null) {
-  const error = h('p', { class: 'form-error', role: 'alert', hidden: true });
-  const submit = h('button', { class: 'button primary', type: 'submit' }, submitLabel);
-  const form = h('form', {
-    class: 'auth-card',
-    novalidate: true,
-    onsubmit: async (event) => {
-      event.preventDefault();
-      submit.disabled = true;
-      error.hidden = true;
-      try {
-        await onSubmit();
-      } catch (failure) {
-        error.textContent = failure.message;
-        error.hidden = false;
-      } finally {
-        submit.disabled = false;
-      }
-    },
-  }, h('h1', {}, title), h('p', { class: 'muted' }, intro), extra, ...fields, error, submit);
-  return form;
-}
-
-function passwordPair(model) {
-  return [
-    field('Mot de passe', textInput(model, 'password', { type: 'password', autocomplete: 'new-password' }), 'Au moins 12 caractères. Une phrase facile à retenir fonctionne bien.'),
-    field('Confirmez le mot de passe', textInput(model, 'confirm', { type: 'password', autocomplete: 'new-password' })),
-  ];
-}
-
-function checkPair(model) {
-  if (model.password !== model.confirm) throw new Error('Les deux mots de passe ne correspondent pas.');
-}
-
 async function enterApp(user) {
   app.user = user;
-  history.replaceState(null, '', '/');
-  // Retire le formulaire, et avec lui le mot de passe saisi.
-  $('auth').replaceChildren();
-  $('auth').hidden = true;
   $('app-shell').hidden = false;
   $('topbar-actions').hidden = false;
   $('account-name').textContent = user.name;
   $('account-role').textContent = ROLE_LABELS[user.role];
   $('add-site').hidden = !can('admin');
-  $('team-button').hidden = !can('admin') || app.demo;
+  // Comptes, groupes et journal se gèrent dans l'administration Django.
+  $('admin-link').hidden = !app.links.admin;
+  if (app.links.admin) $('admin-link').href = app.links.admin;
   $('account-button').hidden = app.demo;
-  app.view = 'sites';
   app.sidebarRendered = '';
   $('detail').dataset.key = '';
   await refresh(true);
 }
 
-async function showAuth(kind, { notice = null, token = null } = {}) {
-  $('app-shell').hidden = true;
-  $('topbar-actions').hidden = true;
+function showNoAccess() {
   $('auth').hidden = false;
-  document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close());
-  const noticeNode = notice ? h('p', { class: 'banner warn' }, notice) : null;
-
-  if (kind === 'setup') {
-    const model = { name: '', email: '', password: '', confirm: '' };
-    $('auth').replaceChildren(authCard(
-      'Créer le compte administrateur',
-      'Première utilisation : ce compte pourra ensuite inviter le reste de l’équipe.',
-      [field('Nom', textInput(model, 'name', { autocomplete: 'name' })), field('E-mail', textInput(model, 'email', { type: 'email', autocomplete: 'email' })), ...passwordPair(model)],
-      'Créer le compte',
-      async () => {
-        checkPair(model);
-        const { user } = await api('/setup', { method: 'POST', body: { token, name: model.name, email: model.email, password: model.password } });
-        await enterApp(user);
-      },
-      noticeNode,
-    ));
-  } else if (kind === 'invite') {
-    let invited;
-    try {
-      ({ user: invited } = await api('/invite/check', { method: 'POST', body: { token } }));
-    } catch (error) {
-      $('auth').replaceChildren(h('div', { class: 'auth-card' }, h('h1', {}, 'Lien invalide'), h('p', { class: 'muted' }, error.message),
-        h('button', { class: 'button primary', type: 'button', onclick: () => showAuth('login') }, 'Aller à la connexion')));
-      return;
-    }
-    const model = { password: '', confirm: '' };
-    const current = app.sessionUser;
-    const otherSession = current && current.email !== invited.email
-      ? h('p', { class: 'banner warn' }, `Vous êtes connecté en tant que ${current.email}. Continuer vous déconnectera de ce compte.`)
-      : null;
-    $('auth').replaceChildren(authCard(
-      `Bienvenue, ${invited.name}`,
-      `Choisissez votre mot de passe pour ${invited.email}. Rôle : ${ROLE_LABELS[invited.role]}.`,
-      passwordPair(model),
-      'Enregistrer et entrer',
-      async () => {
-        checkPair(model);
-        const { user } = await api('/invite/accept', { method: 'POST', body: { token, password: model.password } });
-        await enterApp(user);
-      },
-      otherSession,
-    ));
-  } else {
-    const model = { email: '', password: '' };
-    $('auth').replaceChildren(authCard(
-      'Connexion',
-      'Mot de passe oublié ? Demandez un nouveau lien à un administrateur.',
-      [field('E-mail', textInput(model, 'email', { type: 'email', autocomplete: 'username' })), field('Mot de passe', textInput(model, 'password', { type: 'password', autocomplete: 'current-password' }))],
-      'Se connecter',
-      async () => {
-        const { user } = await api('/login', { method: 'POST', body: model });
-        await enterApp(user);
-      },
-      noticeNode,
-    ));
-  }
-  $('auth').querySelector('input')?.focus();
+  $('auth').replaceChildren(h('div', { class: 'auth-card' },
+    h('h1', {}, 'Pas encore d’accès'),
+    h('p', { class: 'muted' }, 'Votre compte existe, mais n’appartient à aucun groupe de l’agent. Demandez à un administrateur de vous ajouter au groupe Lecteurs, Opérateurs ou Administrateurs.'),
+    h('button', { class: 'button primary', type: 'button', onclick: logout }, 'Se déconnecter'),
+  ));
 }
 
 /* Mon compte */
 function openAccount() {
-  $('account-form').reset();
-  $('account-error').hidden = true;
-  $('account-summary').textContent = `${app.user.email} · ${ROLE_LABELS[app.user.role]}`;
+  $('account-summary').textContent = `${app.user.email || app.user.id} · ${ROLE_LABELS[app.user.role]}`;
+  $('account-password').href = app.links.password ?? '#';
   $('account-dialog').showModal();
 }
 
-async function changePassword(event) {
-  event.preventDefault();
-  $('account-error').hidden = true;
-  $('account-submit').disabled = true;
-  try {
-    await api('/me/password', { method: 'POST', body: { current: $('account-current').value, next: $('account-next').value } });
-    $('account-dialog').close();
-    toast('Mot de passe changé.', 'good');
-  } catch (error) {
-    $('account-error').textContent = error.message;
-    $('account-error').hidden = false;
-  } finally {
-    $('account-submit').disabled = false;
-  }
-}
-
 async function logout() {
-  await api('/logout', { method: 'POST', body: {} }).catch(() => {});
-  app.user = null;
-  showAuth('login');
+  await fetch(app.links.logout ?? '/comptes/deconnexion/', {
+    method: 'POST',
+    headers: { 'x-csrftoken': csrfToken() },
+    credentials: 'same-origin',
+  }).catch(() => {});
+  location.assign(app.links.login ?? LOGIN_URL);
 }
 
 async function start() {
-  const params = new URLSearchParams(location.search);
   const session = await api('/session');
   app.demo = session.demo;
-  app.sessionUser = session.user;
-  // Un lien d'invitation passe avant la session en cours : sur un poste partagé, il ne doit pas ouvrir le compte d'un autre.
-  if (location.pathname === '/invite' && !session.demo) {
-    await showAuth('invite', { token: params.get('token') });
-  } else if (session.user) {
-    await enterApp(session.user);
-  } else if (location.pathname === '/setup' && session.setupRequired) {
-    await showAuth('setup', { token: params.get('token') });
-  } else if (session.setupRequired) {
-    await showAuth('login', { notice: "Aucun compte n'existe encore. Ouvrez le lien d'installation : double-cliquez sur « Site Agent.cmd » sur la machine de l'agent, il s'affiche et s'ouvre automatiquement." });
-  } else {
-    await showAuth('login');
-  }
+  app.links = session.links ?? {};
+  if (session.user) await enterApp(session.user);
+  else if (session.noAccess) showNoAccess();
+  else goToLogin();
 }
 
 $('add-site').addEventListener('click', openAddDialog);
@@ -1132,15 +892,9 @@ $('add-dir').addEventListener('change', inspectDirectory);
 document.querySelectorAll('input[name="add-source"]').forEach((radio) => radio.addEventListener('change', syncAddSource));
 $('add-form').addEventListener('submit', submitAdd);
 $('watch-toggle').addEventListener('click', toggleWatch);
-$('team-button').addEventListener('click', () => {
-  app.view = 'team';
-  $('detail').dataset.key = '';
-  render();
-});
 $('account-button').addEventListener('click', openAccount);
 $('account-cancel').addEventListener('click', () => $('account-dialog').close());
-$('account-form').addEventListener('submit', changePassword);
 $('logout-button').addEventListener('click', logout);
 
 start().catch((error) => toast(error.message, 'bad'));
-setInterval(() => { if (app.user && !document.hidden && app.view === 'sites') refresh(); }, POLL_MS);
+setInterval(() => { if (app.user && !document.hidden) refresh(); }, POLL_MS);

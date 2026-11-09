@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -9,10 +9,10 @@ import { createBackup } from '../src/backup.js';
 import { redactGitUrl, validateGitUrl } from '../src/git-clone.js';
 import { Registry } from '../src/registry.js';
 import { createUiServer } from '../src/ui/server.js';
+import { signedClient } from './support.js';
 
 const ROOT = fileURLToPath(new URL('..', import.meta.url));
 const CLI = path.join(ROOT, 'src', 'cli.js');
-const PASSWORD = 'un mot de passe solide';
 
 function tempDir(prefix) {
   return mkdtempSync(path.join(tmpdir(), prefix));
@@ -38,23 +38,11 @@ function createSourceRepository() {
 }
 
 async function withServer(home, options, scenario) {
-  const server = await createUiServer(new Registry(home), { port: 0, log: () => {}, ...options });
-  const { origin, loginUrl } = await server.listen();
-  const token = new URL(loginUrl).searchParams.get('token');
-  let cookie = null;
-  const call = async (method, target, body) => {
-    const response = await fetch(`${origin}/api${target}`, {
-      method,
-      headers: { ...(cookie ? { cookie } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    const fresh = response.headers.get('set-cookie');
-    if (fresh) cookie = fresh.split(';')[0];
-    return { status: response.status, json: await response.json() };
-  };
+  const registry = new Registry(home);
+  const server = await createUiServer(registry, { port: 0, log: () => {}, ...options });
+  const { origin } = await server.listen();
+  const call = signedClient(origin, readFileSync(path.join(registry.dataDir(), 'proxy-secret'), 'utf8'), { username: 'admin', role: 'admin' });
   try {
-    if (token) await call('POST', '/setup', { token, name: 'Admin', email: 'admin@example.com', password: PASSWORD });
-    else await call('POST', '/login', { email: 'admin@example.com', password: PASSWORD });
     await scenario(call);
   } finally {
     await server.close();
@@ -129,21 +117,21 @@ test('surveillance : reprise automatique après redémarrage', async () => {
   }
 });
 
-test('sauvegarde : configuration, comptes et historique, sans verrou ni lien d’installation', async () => {
+test('sauvegarde : configuration et historique, sans verrou ni clés', async () => {
   const home = tempDir('site-agent-home-');
   try {
     writeFileSync(path.join(home, 'agent.defaults.json'), '{}');
     mkdirSync(path.join(home, 'sites'));
     writeFileSync(path.join(home, 'sites', 'vitrine.json'), '{}');
     mkdirSync(path.join(home, '.site-agent', 'vitrine'), { recursive: true });
-    for (const file of ['users.json', 'audit.jsonl', 'lock', 'ui-token']) writeFileSync(path.join(home, '.site-agent', file), 'x');
+    for (const file of ['watch.json', 'lock', 'proxy-secret', 'django-secret-key']) writeFileSync(path.join(home, '.site-agent', file), 'x');
     writeFileSync(path.join(home, '.site-agent', 'vitrine', 'history.jsonl'), 'x');
 
     const target = await createBackup(home, { now: new Date('2026-11-09T10:00:00Z') });
-    for (const kept of ['agent.defaults.json', 'sites/vitrine.json', '.site-agent/users.json', '.site-agent/audit.jsonl', '.site-agent/vitrine/history.jsonl']) {
+    for (const kept of ['agent.defaults.json', 'sites/vitrine.json', '.site-agent/watch.json', '.site-agent/vitrine/history.jsonl']) {
       assert.ok(existsSync(path.join(target, kept)), kept);
     }
-    for (const skipped of ['.site-agent/lock', '.site-agent/ui-token']) assert.ok(!existsSync(path.join(target, skipped)), skipped);
+    for (const skipped of ['.site-agent/lock', '.site-agent/proxy-secret', '.site-agent/django-secret-key']) assert.ok(!existsSync(path.join(target, skipped)), skipped);
 
     for (let day = 10; day < 14; day += 1) await createBackup(home, { keep: 3, now: new Date(`2026-11-${day}T10:00:00Z`) });
     const remaining = readdirSync(path.join(home, 'backups')).sort();
@@ -154,36 +142,27 @@ test('sauvegarde : configuration, comptes et historique, sans verrou ni lien d�
   }
 });
 
-test('setup-link : donne le lien tant qu’aucun compte n’existe, avec l’adresse publique', async () => {
+test('serve : démarre sans navigateur, lance l’administration, répond et sauvegarde', async () => {
   const home = tempDir('site-agent-home-');
-  try {
-    writeFileSync(path.join(home, 'agent.defaults.json'), JSON.stringify({ ui: { publicUrl: 'https://agent.example.fr' } }));
-    const first = await cli(home, 'setup-link');
-    assert.match(first.output, /https:\/\/agent\.example\.fr\/setup\?token=[0-9a-f]+/);
-    assert.equal((await cli(home, 'setup-link')).output, first.output, 'le même lien tant qu’il n’a pas servi');
-
-    await cli(home, 'user', 'add', 'a@example.com', '--role', 'admin');
-    assert.match((await cli(home, 'setup-link')).output, /existe déjà/);
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
-});
-
-test('serve : démarre sans navigateur, répond et sauvegarde', async () => {
-  const home = tempDir('site-agent-home-');
-  const child = spawn(process.execPath, [CLI, 'serve', '--port', '0', '--home', home]);
+  writeFileSync(path.join(home, 'agent.defaults.json'), JSON.stringify({ ui: { port: 0, webPort: 0 } }));
+  // Un faux Python : on vérifie que l'agent lance l'administration, pas Django lui-même.
+  const fakePython = path.join(home, 'fake-python.cmd');
+  writeFileSync(fakePython, ['@echo Administration Django prête %*', '@ping -n 30 127.0.0.1 >nul', ''].join('\r\n'));
+  const child = spawn(process.execPath, [CLI, 'serve', '--home', home], { env: { ...process.env, SITE_AGENT_PYTHON: fakePython } });
   try {
     let output = '';
     child.stdout.on('data', (chunk) => { output += chunk; });
     child.stderr.on('data', (chunk) => { output += chunk; });
-    for (let attempt = 0; attempt < 100 && !output.includes('Sauvegarde créée'); attempt += 1) {
+    for (let attempt = 0; attempt < 100 && !(output.includes('Sauvegarde créée') && output.includes('[admin]')); attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
     const origin = /démarré sur (http:\/\/[\d.]+:\d+)/.exec(output)?.[1];
     assert.ok(origin, output);
-    assert.match(output, /setup-link/, 'indique comment obtenir le lien, sans l’afficher dans le journal');
-    assert.doesNotMatch(output, /token=/);
-    assert.equal((await (await fetch(`${origin}/api/session`)).json()).service, 'site-agent');
+    assert.match(output, /\[admin\] Administration Django pr.{1,2}te .*manage\.py serve --port 0/);
+    const session = await (await fetch(`${origin}/api/session`)).json();
+    assert.equal(session.service, 'site-agent');
+    assert.equal(session.user, null, 'sans identité signée par Django, personne n’est connecté');
+    assert.ok(existsSync(path.join(home, '.site-agent', 'proxy-secret')), 'la clé partagée est créée');
     assert.equal(readdirSync(path.join(home, 'backups')).length, 1);
   } finally {
     child.kill();

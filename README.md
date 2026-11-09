@@ -2,7 +2,26 @@
 
 Agent qui surveille vos sites en ligne et les met à jour selon des règles que vous définissez. Vous lui associez n'importe quel site à la demande, et vous le lancez sur un site ou sur tous. Il couvre quatre cas : dépendances, nouveau code, contenu et réparation des pannes. Chaque changement est testé, vérifié après déploiement et annulé en cas de problème.
 
-Il fonctionne sans dépendance externe. Il faut Node.js 20 ou plus récent, ainsi que Git.
+Il faut :
+- **Node.js 20 ou plus récent** et **Git**, pour l'agent ;
+- **Python 3.11 ou plus récent** et **PostgreSQL**, pour l'administration des comptes (Django, dossier [webadmin](webadmin)) ;
+- **Ollama**, seulement si vous activez l'analyse IA des mises à jour (LangChain).
+
+Installation, une fois :
+
+```bash
+npm install
+```
+
+```bash
+python -m venv webadmin/.venv
+```
+
+```bash
+webadmin/.venv/Scripts/python -m pip install -r webadmin/requirements/local.txt
+```
+
+Copiez ensuite [webadmin/.env.example](webadmin/.env.example) en `webadmin/.env` et indiquez-y la base PostgreSQL.
 
 ## Interface graphique
 
@@ -26,49 +45,41 @@ Pour la surveillance, le bouton du haut suit tous les sites tant que l'interface
 
 ## Équipe et comptes
 
-Chaque personne a son propre compte et son rôle :
+Les comptes sont gérés par **Django**, avec son administration complète à l'adresse `/admin/`, et stockés dans PostgreSQL. L'agent Node.js ne connaît aucun mot de passe : Django lui transmet, pour chaque requête, qui est connecté et avec quel rôle, signé avec une clé partagée. L'agent n'écoute que sur la machine elle-même et refuse toute requête non signée.
 
-| Rôle | Peut |
+Le projet Django suit l'organisation de cookiecutter-django :
+
+| Dossier | Contenu |
 |---|---|
-| Lecteur | Consulter les sites, leur état et leur historique |
-| Opérateur | En plus : simuler, lancer un cycle, valider ou refuser une mise à jour, relancer un site en pause |
-| Administrateur | Tout : associer des sites, passer en mode réel, modifier les règles et les commandes, gérer l'équipe, activer la surveillance |
+| `webadmin/config/` | Réglages (`base`, `local`, `production`, `test`), adresses, routeur de l'API |
+| `webadmin/site_agent/users/` | Modèle `User`, rôles, formulaires, administration, API (serializers et vues) |
+| `webadmin/site_agent/audit/` | Journal d'audit : modèle, services, administration, API en lecture seule |
+| `webadmin/site_agent/agent/` | Passerelle vers l'agent : services (signature, client HTTP), session, vues |
+
+Le rôle vient du groupe Django de la personne :
+
+| Groupe | Peut |
+|---|---|
+| Lecteurs | Consulter les sites, leur état et leur historique |
+| Opérateurs | En plus : simuler, lancer un cycle, valider ou refuser une mise à jour, relancer un site en pause |
+| Administrateurs | Tout : associer des sites, passer en mode réel, modifier les règles et les commandes, activer la surveillance, gérer les comptes |
 
 > Un administrateur écrit des commandes que la machine exécute : ce rôle équivaut à un accès complet au serveur. Réservez-le à une ou deux personnes de confiance.
 
-**Premier lancement :**
-1. `Site Agent.cmd` ouvre un lien d'installation. Il ne sert qu'une fois et ne se partage pas.
-2. Vous y créez le compte administrateur.
-3. Si vous fermez l'onglet avant, relancez `Site Agent.cmd` : le lien se rouvre.
+**Premier administrateur :**
 
-**Inviter quelqu'un :**
-1. Dans **Équipe**, saisissez son e-mail et son rôle.
-2. Envoyez-lui le lien obtenu par un canal privé. Il est valable 48 h, à usage unique.
-3. La personne y choisit elle-même son mot de passe : personne d'autre ne le connaît.
+```bash
+webadmin/.venv/Scripts/python webadmin/manage.py createsuperuser
+```
 
-**Mot de passe oublié :** un administrateur clique sur **Nouveau lien** en face de la personne. L'ancien mot de passe reste valable jusqu'à ce que le nouveau lien soit utilisé.
+**Ajouter quelqu'un :** dans **Administration → Comptes**, créez le compte, puis ajoutez-le à un groupe. Cochez « Statut équipe » seulement pour qui doit aussi accéder à l'administration.
 
 **Sécurité :**
-- **Mots de passe :** au moins 12 caractères. Seule une empreinte irréversible (scrypt) est conservée, dans `.site-agent/users.json`.
-- **Essais en série :** après 5 échecs, l'adresse est bloquée 15 minutes.
-- **Sessions :** elles expirent après 12 h d'inactivité, et au plus tard après 7 jours. Redémarrer l'interface déconnecte tout le monde.
-- **Désactivation, changement de rôle ou de mot de passe :** l'effet est immédiat, sans attendre une reconnexion.
-- **Contrôle côté serveur :** chaque action est vérifiée sur le serveur. Masquer un bouton ne suffirait pas.
-- **Journal d'audit :** chaque action est enregistrée avec son auteur dans `.site-agent/audit.jsonl`, sans jamais de mot de passe.
-
-**En secours, depuis la ligne de commande :** utile si plus aucun administrateur ne peut se connecter.
-
-```bash
-node src/cli.js user list
-```
-
-```bash
-node src/cli.js user invite admin@exemple.fr
-```
-
-```bash
-node src/cli.js user disable personne@exemple.fr
-```
+- **Mots de passe :** au moins 12 caractères, refus des mots de passe courants, empreinte Django (PBKDF2). « Mot de passe oublié » envoie un lien par courriel, si un serveur SMTP est configuré dans `webadmin/.env`.
+- **Essais en série :** après 5 échecs, le compte est bloqué 15 minutes.
+- **Sessions :** elles expirent après 12 h d'inactivité. Changer son mot de passe déconnecte les autres sessions.
+- **Contrôle côté serveur :** le rôle est vérifié par l'agent sur chaque action, d'après l'identité signée par Django.
+- **Journal d'audit :** connexions, échecs et chaque action passée à l'agent, avec auteur et adresse IP, dans PostgreSQL. Il se consulte dans l'administration, sans pouvoir être modifié.
 
 **Accès à distance :** n'exposez jamais l'interface directement sur Internet. Pour la rendre accessible à une équipe, suivez le guide [Installer Site Agent sur un serveur Windows](docs/installation-windows-server.md). Il la place derrière HTTPS, en fait un service permanent et met en place la sauvegarde quotidienne.
 
@@ -166,6 +177,19 @@ Exemple : un site de vente qui se gèle pour les soldes et valide tout à la mai
 | Dépendance | Version corrective | Version mineure, ou correctif de dépendances indirectes | Version majeure ou préversion |
 | Code | Peu de fichiers et de lignes (`maxLowRisk*`) | Changement plus gros | Touche un chemin de `sensitivePaths` |
 | Contenu | Peu de lignes modifiées (`maxLowRiskChangeRatio`) | Modification importante ou nouveau fichier | — |
+
+### Analyse IA des mises à jour
+
+Si vous l'activez (**Règles et facteurs → Analyse IA**), un agent LangChain fait lire chaque mise à jour à un modèle de langage local, servi par [Ollama](https://ollama.com). Le modèle reçoit le journal Git et le diff du code, la nature d'une mise à jour de dépendance et ses avis de sécurité, ou le nouveau contenu. Il rend un risque, une recommandation, un résumé en français et les points à vérifier, affichés à côté de chaque mise à jour.
+
+**L'analyse ne peut que rendre l'agent plus prudent :**
+- le risque retenu est le plus élevé entre celui des règles et celui du modèle ;
+- si le modèle recommande un regard humain, déconseille le déploiement ou estime le risque élevé, la mise à jour attend une validation ;
+- un modèle rassurant n'autorise jamais ce que les règles retiennent. Un diff piégé, qui contiendrait des instructions adressées au modèle, ne peut donc rien débloquer.
+
+Une analyse est gardée tant que la même version reste détectée : le modèle n'est pas réinterrogé à chaque cycle. Si Ollama ne répond pas, l'agent décide avec ses règles seules et vous prévient. Vous pouvez aussi choisir d'exiger alors une validation humaine.
+
+Réglages dans `advisor` ([agent.defaults.json](agent.defaults.json) ou par site) : `enabled`, `model` (par défaut `qwen2.5:7b`), `baseUrl` (par défaut `http://127.0.0.1:11434`), `timeoutSeconds`, `maxDiffChars`, `onError` (`rules` ou `approval`). Gardez Ollama sur la même machine ou sur votre réseau : le code de vos sites lui est envoyé.
 
 ### Écrire des règles
 
