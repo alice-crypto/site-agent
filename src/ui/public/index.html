@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Site Agent</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231f6f5c'/%3E%3Cpath d='M9 17l5 5 9-11' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-name">Site Agent</span>
+    </div>
+    <div id="topbar-actions" class="topbar-actions" hidden>
+      <button id="watch-toggle" class="watch" type="button" aria-pressed="false">
+        <span class="watch-dot" aria-hidden="true"></span>
+        <span id="watch-label">Surveillance arrêtée</span>
+      </button>
+      <button id="add-site" class="button primary" type="button">Associer un site</button>
+      <button id="team-button" class="button" type="button">Équipe</button>
+      <button id="account-button" class="button account" type="button" aria-haspopup="dialog">
+        <span id="account-name"></span>
+        <span id="account-role" class="account-role"></span>
+      </button>
+    </div>
+  </header>
+
+  <main id="auth" class="auth" hidden></main>
+
+  <div id="app-shell" class="layout" hidden>
+    <nav class="sidebar" aria-label="Sites associés">
+      <h2 class="sidebar-title">Sites</h2>
+      <ul id="site-list" class="site-list"></ul>
+    </nav>
+    <main id="detail" class="detail"></main>
+  </div>
+
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+  <dialog id="add-dialog" class="dialog" aria-labelledby="add-title">
+    <form id="add-form" novalidate>
+      <h2 id="add-title">Associer un site</h2>
+      <p class="muted">Il démarre en simulation : rien n'est modifié tant que vous ne le passez pas en mode réel.</p>
+
+      <label class="field">
+        <span>Nom</span>
+        <input id="add-name" autocomplete="off" placeholder="mon-site" required>
+        <small>Lettres, chiffres, tirets.</small>
+      </label>
+      <fieldset class="source-choice">
+        <legend>D'où vient le site ?</legend>
+        <label class="toggle"><input type="radio" name="add-source" value="git" checked> Son adresse Git : l'agent crée lui-même sa copie</label>
+        <label class="toggle"><input type="radio" name="add-source" value="dir"> Un dossier déjà présent sur cette machine</label>
+      </fieldset>
+      <label id="add-git-row" class="field">
+        <span>Adresse Git du site</span>
+        <input id="add-git" autocomplete="off" placeholder="git@github.com:mon-equipe/mon-site.git">
+        <small>Adresse SSH avec la clé de déploiement du serveur, ou HTTPS pour un dépôt public.</small>
+      </label>
+      <label id="add-dir-row" class="field" hidden>
+        <span>Dossier du site sur cette machine</span>
+        <input id="add-dir" autocomplete="off" placeholder="C:\sites\mon-site">
+        <small>Une copie Git dédiée à l'agent, pas votre dossier de travail : il y fait des retours arrière.</small>
+      </label>
+      <label class="field">
+        <span>Adresse en ligne</span>
+        <input id="add-url" type="url" autocomplete="off" placeholder="https://mon-site.fr" required>
+      </label>
+
+      <p id="add-detected" class="detected" hidden></p>
+
+      <fieldset class="commands">
+        <legend>Commandes</legend>
+        <p class="muted">Déjà remplies si le dossier contient un package.json. Seul le déploiement est indispensable pour le mode réel.</p>
+        <div class="command-grid">
+          <label class="field"><span>Déploiement</span><input id="add-deploy" autocomplete="off" placeholder="npm run deploy"></label>
+          <label class="field"><span>Tests</span><input id="add-test" autocomplete="off" placeholder="npm test"></label>
+          <label class="field"><span>Installation</span><input id="add-install" autocomplete="off" placeholder="npm ci"></label>
+          <label class="field"><span>Build</span><input id="add-build" autocomplete="off" placeholder="npm run build"></label>
+          <label class="field"><span>Redémarrage</span><input id="add-restart" autocomplete="off" placeholder="pm2 restart mon-site"></label>
+        </div>
+      </fieldset>
+
+      <p id="add-error" class="form-error" role="alert" hidden></p>
+      <div class="dialog-actions">
+        <button id="add-cancel" class="button" type="button">Annuler</button>
+        <button id="add-submit" class="button primary" type="submit">Associer</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="account-dialog" class="dialog dialog-small" aria-labelledby="account-title">
+    <form id="account-form" novalidate>
+      <h2 id="account-title">Mon compte</h2>
+      <p id="account-summary" class="muted"></p>
+      <h3 class="spaced">Changer de mot de passe</h3>
+      <label class="field"><span>Mot de passe actuel</span><input id="account-current" type="password" autocomplete="current-password"></label>
+      <label class="field"><span>Nouveau mot de passe</span><input id="account-next" type="password" autocomplete="new-password" minlength="12"><small>Au moins 12 caractères. Vos autres sessions seront déconnectées.</small></label>
+      <p id="account-error" class="form-error" role="alert" hidden></p>
+      <div class="dialog-actions spread">
+        <button id="logout-button" class="button danger" type="button">Se déconnecter</button>
+        <span class="dialog-actions-group">
+          <button id="account-cancel" class="button" type="button">Fermer</button>
+          <button id="account-submit" class="button primary" type="submit">Changer</button>
+        </span>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="confirm-dialog" class="dialog dialog-small" aria-labelledby="confirm-title">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-text"></p>
+    <div class="dialog-actions">
+      <button id="confirm-cancel" class="button" type="button">Annuler</button>
+      <button id="confirm-ok" class="button primary" type="button"></button>
+    </div>
+  </dialog>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

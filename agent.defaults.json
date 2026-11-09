@@ -1,0 +1,77 @@
+{
+  "stateDir": ".site-agent",
+  "health": {
+    "samples": 5,
+    "intervalMs": 1000,
+    "timeoutMs": 5000,
+    "maxErrorRate": 0,
+    "maxP95LatencyMs": 2000,
+    "settleSeconds": 15
+  },
+  "schedule": {
+    "healthIntervalSeconds": 60,
+    "detectIntervalMinutes": 60,
+    "timezone": "Europe/Paris",
+    "windows": [
+      { "days": ["mon", "tue", "wed", "thu"], "start": "02:00", "end": "05:00" }
+    ],
+    "freezes": []
+  },
+  "detectors": {
+    "code": {
+      "maxLowRiskFiles": 5,
+      "maxLowRiskLines": 100,
+      "sensitivePaths": ["^migrations/", "(^|/)\\.env", "package(-lock)?\\.json$", "(^|/)Dockerfile$", "^\\.github/"]
+    },
+    "content": {
+      "maxLowRiskChangeRatio": 0.3
+    },
+    "incident": {
+      "enabled": true,
+      "failuresBeforeAction": 3,
+      "cooldownMinutes": 30,
+      "maxPerDay": 3
+    }
+  },
+  "policy": {
+    "default": "approval",
+    "maxAutoPerDay": 5,
+    "maxConsecutiveFailures": 2,
+    "rules": [
+      {
+        "name": "Faille grave corrigeable sans rupture",
+        "when": { "type": "dependency", "severity": ["critical", "high"], "updateKind": ["patch", "minor", "transitive"] },
+        "action": "auto",
+        "bypassWindow": true
+      },
+      {
+        "name": "Correctif mineur de dépendance",
+        "when": { "type": "dependency", "updateKind": "patch" },
+        "action": "auto"
+      },
+      {
+        "name": "Petit changement de code",
+        "when": { "type": "code", "risk": "low" },
+        "action": "auto"
+      },
+      {
+        "name": "Petite modification de contenu",
+        "when": { "type": "content", "risk": "low" },
+        "action": "auto"
+      }
+    ]
+  },
+  "webhook": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 8787,
+    "secretEnv": "SITE_AGENT_WEBHOOK_SECRET"
+  },
+  "ui": {
+    "port": 4310,
+    "publicUrl": null
+  },
+  "notify": {
+    "webhookUrlEnv": "SITE_AGENT_NOTIFY_WEBHOOK"
+  }
+}

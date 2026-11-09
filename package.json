@@ -1,0 +1,16 @@
+{
+  "name": "site-agent",
+  "version": "0.1.0",
+  "description": "Agent qui met à jour un site en ligne selon des règles de risque, de calendrier et de santé.",
+  "type": "module",
+  "private": true,
+  "engines": { "node": ">=20" },
+  "bin": { "site-agent": "src/cli.js" },
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "ui": "node src/cli.js ui",
+    "ui:demo": "node demo/ui-demo.js",
+    "demo": "node demo/run-demo.js",
+    "status": "node src/cli.js status"
+  }
+}
